@@ -1,0 +1,19 @@
+Sat Feb 8 Ruben
+
+Just wrote some basic code for the cliet and the server. The idea is simple. From the client's perspective, 
+
+When trying to compile client.cpp, there was no matching function for call to 'gethostbyname.' It turns out this funciton is obsolete. I used 'getaddrinfo' instead. 
+
+The current code (commit: "") should be fine for sending simple messages (short messages). However, for larger ones, to ensure their full communication, one should use some sort of iteration. 
+
+
+Sat Feb 8 Ruben 
+
+Defined some data structures (e.g., messages). 
+
+I used a naive hashing function. This needs to be changed later. 
+
+
+
+
+Created UserAccount.cpp and .h class files. 
