@@ -34,6 +34,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Next, we need to determine an address for the client.
 
     struct addrinfo hints; 
     memset(&hints, 0, sizeof(hints)); 
@@ -44,25 +45,21 @@ int main(int argc, char** argv) {
     hints.ai_addr = NULL; 
     hints.ai_canonname = NULL; 
     hints.ai_next = NULL; 
-
-
     
-    // Define a pointer to the list of potential host addresses that 
+    // Define a pointer to the list of potential client addresses that 
     // getaddrinfo will allocate. 
     struct addrinfo* result; 
-    
+
+    /* getaddrinfo() returns a list of address structures.
+    Try each address until we successfully bind(2).      
+    If socket(2) (or bind(2)) fails, we (close the socket
+    and) try the next address. */  
+ 
     int s = getaddrinfo(NULL, server_port, &hints, &result); 
     if (s != 0) {
         fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(s));
         exit(EXIT_FAILURE);
     }
-
- 
-    
-    /* getaddrinfo() returns a list of address structures.
-    Try each address until we successfully bind(2).      
-    If socket(2) (or bind(2)) fails, we (close the socket
-    and) try the next address. */
 
     struct addrinfo* client_addrinfo;
     int client_sfd; // Socket file descriptor 
@@ -88,61 +85,61 @@ int main(int argc, char** argv) {
     // We have a connected socket: client_sfd.
     std::cout << "Connected to " << server_ip 
               << " on port " << server_port << "\n";
-
-    // So far, so far a connection has been established. By this point, the client has a
-    // socket specified by `client_sfd`. Also, we've captured the client `addrinfo`. 
-    // The next step is to allow the clinet to send messages to the server.  
     
-
-    // By this point, we have some information about the user. 
-    UserAccount user; 
-    user.set_ip_address(server_ip); 
-    user.set_socket_fd(client_sfd); 
-
-
-    // Now, we shall ask the user to create an account if new, and set a password. 
-    
+    // By this points, we have successfully established a 
+    // socket for the client. Now, we shall ask the user 
+    // to either register or log in. 
 
     bool logged_in = false;
     while (!logged_in) {
-        std::cout << "Do you want to REGISTER(R) or LOGIN(L)? ";
-        std::string choice;
-        if (!std::getline(std::cin, choice)) {
-            std::cout << "EOF on stdin. Exiting.\n";
-            close(client_sfd);
-            return 0;
+
+        char choice; 
+        std::cout << "Do you want to REGISTER(r) or LOGIN(l)? ";
+        std::cin >> choice; 
+
+        if (!choice) {
+            std::cout << "EOF on stdin. Type 'e' to exit. Type something else to continue. \n"; 
+            std::cin >> choice; 
+            if (choice == 'e') {
+                close(client_sfd);
+                return 0;
+            } else {
+                continue;   
+            }
         }
 
-        // We want a valid command, e.g. "REGISTER" or "LOGIN"
-        if (choice != "R" && choice != "L") {
-            std::cout << "Please type 'R' (to register) or 'L' (to log in).\n";
+        // Validate command
+        if (choice != 'r' && choice != 'l') {
+            std::cout << "Please type 'r' (to register) or 'l' (to log in). \n";
             continue;
         }
 
-        if (choice == "R") {
-            // Communicate to the server to get list of used usernames. 
-
+        if (choice == 'r') {    // Register
 
             // Ask for username & password
             std::string username, password;
             std::cout << "Enter username: ";
             if (!std::getline(std::cin, username)) {
-                std::cout << "EOF on stdin. Exiting.\n";
+                std::cout << "EOF on stdin. Exiting.\n";        // Better error handling needs 
+                                                                // to be implemented. 
                 break;
             }
             std::cout << "Enter password: ";
             if (!std::getline(std::cin, password)) {
-                std::cout << "EOF on stdin. Exiting.\n";
+                std::cout << "EOF on stdin. Exiting.\n";        // Same problem here. 
                 break;
             }
 
-            // Set in our local user object (client side)
-            user.set_username(username);
-            user.set_password(password);
-        } else if (choice == "L") {
-            // Comunicate to the server to see if password matches the username. 
-            
-
+            // Send username and password to the server. 
+            // If username is available, the server creates a new UserAccount object
+            // for the new user. If not, the client is asked to enter a different username 
+            // and a password again.
+             
+        } else if (choice == 'l') {
+            // Send username and password to the server. 
+            // If username and password match, the server updates the socket for
+            // this user (if needed). If username and/or password are not valid, 
+            // the user is asked to try again. 
 
 
         }

@@ -31,14 +31,6 @@ std::string UserAccount::get_hashed_password() const {
     return hashed_password;
 }
 
-void UserAccount::set_ip_address(const std::string& ip) {
-    ip_address = ip;
-}
-
-std::string UserAccount::get_ip_address() const {
-    return ip_address;
-}
-
 void UserAccount::set_socket_fd(int fd) {
     socket_fd = fd;
 }

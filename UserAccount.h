@@ -8,7 +8,6 @@ private:
     std::string username;
     std::string password;
     std::string hashed_password;
-    std::string ip_address;
     int socket_fd;
     std::string hash_function(const std::string& pass);
 
@@ -24,9 +23,6 @@ public:
 
     void hash_password();
     std::string get_hashed_password() const;
-
-    void set_ip_address(const std::string& ip);
-    std::string get_ip_address() const;
 
     void set_socket_fd(int fd);
     int get_socket_fd() const;

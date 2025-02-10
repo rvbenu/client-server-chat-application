@@ -9,46 +9,50 @@
 #include <netdb.h> 
 #include <cstdio>
 #include <cstdlib>
-#include <thread> 
+#include <thread>
+#include "UserAccount.h"
+#include <unordered_map> 
+
+
+
+
+
+
+
+
+// Contains all user accounts.
+// Keys are usernames and values are UserAccount objects. 
+std::unordered_map<std::string, UserAccount> user_accounts; 
+
 
 
 
 // The following function is intended to be executed concurrently. 
-void manage_client_communication(int client_sfd, sockaddr_in client_addr) { 
+void handle_client(int client_sfd, sockaddr_in client_addr) { 
     
-    char client_ip[INET_ADDRSTRLEN];
-    // inet_ntop convert IPv4 and IPv6 addresses from binary to text form
-    inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
-    int client_port = ntohs(client_addr.sin_port);
 
-    std::cout << "Connected to client " << client_ip << " on port " << client_port << std::endl; 
-
-    const char* welcome_msg = "Welcome!\n";
-    ssize_t bytes_sent = send(client_sfd, welcome_msg, strlen(welcome_msg), 0);
-    if (bytes_sent == -1) {
-        perror("send");
-    } else {
-        std::cout << "Sent welcome message to " << client_ip << ":" << client_port << std::endl;
-    }
+    // The first thing that the server should receive from a client is a password, a username,
+    // and whether the client is trying to log in or register. The server then validates this 
+    // and sends either a success message to the client and a try-again message. 
 
 
-    close(client_sfd);  
-    std::cout << "Connection ended. \n"; 
-
-}   
+}
 
 
 
 int main(int argc, char** argv) {
 
-    // User is responsible for entering the server port number.  
+
+    // User enters the port number. 
     if (argc != 2) {
         fprintf(stderr, "Usage: %s <port number>\n", argv[0]);
-        exit(EXIT_FAILURE); 
+        exit(EXIT_FAILURE);  
     }
 
     const char* server_port = argv[1];
 
+    // Next, we need to determine an address for the server.
+    
     struct addrinfo hints; 
     memset(&hints, 0, sizeof(hints)); 
     hints.ai_family = AF_INET;              // Allow IPv4 only 
@@ -59,46 +63,48 @@ int main(int argc, char** argv) {
     hints.ai_canonname = NULL; 
     hints.ai_next = NULL; 
 
-    // Define a pointer to the list of potential host addresses that 
-    // getaddrinfo will allocate. 
+    // Define a pointer to the list of potential server 
+    // addresses that getaddrinfo will allocate. 
     struct addrinfo* result; 
-    
+ 
+    /* getaddrinfo() returns a list of address structures.
+    Try each address until we successfully bind(2).      
+    If socket(2) (or bind(2)) fails, we (close the socket
+    and) try the next address. */  
+
     int s = getaddrinfo(NULL, server_port, &hints, &result); 
     if (s != 0) {
         fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(s));
         exit(EXIT_FAILURE);
     }
 
-    /* getaddrinfo() returns a list of address structures.
-    Try each address until we successfully bind(2).      
-    If socket(2) (or bind(2)) fails, we (close the socket
-    and) try the next address. */
-
-    struct addrinfo* p;
+    
+    struct addrinfo* server_addrinfo;
     int sfd; // Socket file descriptor 
 
-    for (p = result; p != NULL; p = p->ai_next) {
-        sfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);    
+    for (server_addrinfo = result; 
+            server_addrinfo != NULL; 
+            server_addrinfo = server_addrinfo->ai_next) {
+        
+        sfd = socket(server_addrinfo->ai_family, 
+                server_addrinfo->ai_socktype, 
+                server_addrinfo->ai_protocol);    
         if (sfd == -1) continue;  
-        if (bind(sfd, p->ai_addr, p->ai_addrlen) == 0) {
-            break;   // Success.
+        if (bind(sfd, server_addrinfo->ai_addr, 
+                    server_addrinfo->ai_addrlen) == 0) {
+            break;      // Successfully binded the the
+                        // socket to the server address.  
         }
         close(sfd); 
     }
 
     freeaddrinfo(result); 
 
-    if (!p) {           // No address succeeded. 
+    if (!server_addrinfo) {           // No address succeeded. 
         fprintf(stderr, "Could not bind\n");
         exit(EXIT_FAILURE);
     }
     
-    // Now, a socket has been succesfully established and 'sfd' is its file descriptor. 
-    // We also have successfully captured the addrinfo of the server in `p`. 
-    // The next step is to establish the TCP-like connection with the clients. 
-    // We need to listen, accept, wait for connection, and then we can receive and send messages. 
-    
-
     // Mark the server socket as accepting connections. 
     if (listen(sfd, 10) == -1) {    // Limit the amount of connections on queue to 10. 
         fprintf(stderr, "Cound not listen. \n"); 
@@ -107,7 +113,7 @@ int main(int argc, char** argv) {
 
     std::cout << "Listening on port " << server_port << std::endl; 
 
-    // Accept
+    // Accepting connections from clients. 
     for (;;) {
         struct sockaddr_in client_addr; 
         socklen_t client_addr_len = sizeof(client_addr); 
@@ -118,7 +124,7 @@ int main(int argc, char** argv) {
         }
 
         // Create a thread to handle multiple clients. 
-        std::thread client_thread(manage_client_communication, client_sfd, client_addr); 
+        std::thread client_thread(handle_client, client_sfd, client_addr); 
         client_thread.detach();     // So that each client can be managed independently. 
     }
 

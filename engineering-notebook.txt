@@ -1,19 +1,28 @@
 Sat Feb 8 Ruben
 
-Just wrote some basic code for the cliet and the server. The idea is simple. From the client's perspective, 
+Used getaddrinfo() to find a feasible address to establish a connection between cleint and server. 
 
-When trying to compile client.cpp, there was no matching function for call to 'gethostbyname.' It turns out this funciton is obsolete. I used 'getaddrinfo' instead. 
-
-The current code (commit: "") should be fine for sending simple messages (short messages). However, for larger ones, to ensure their full communication, one should use some sort of iteration. 
-
-
-Sat Feb 8 Ruben 
-
-Defined some data structures (e.g., messages). 
-
-I used a naive hashing function. This needs to be changed later. 
+`server.cpp` and `client.cpp` assume the messages sent will be short for now. 
+TO-DO: When larger messages are sent, they must be broken down. This is to be implemented. 
 
 
 
 
-Created UserAccount.cpp and .h class files. 
+
+
+
+Sat Feb 9 Ruben 
+
+In `server.cpp`, connections are continuously being accepted by using an 
+infinite loop. When a connection is accepted, a thread is crated. Function 
+`manage_client_communication` manages client communication independently.
+The thread is detached. 
+
+Created files for the class UserAccount.  
+TO-DO: The `hash_function` for passwords must be implemented.  
+
+So far, the TCP connection with sockets is pretty much managed by the current code. 
+Next, the validation of usernames and passwords must be implemented and the way 
+the server and client will communicate about this must be implemented as well. 
+
+Check comments in server.cpp and client.cpp for more details. 
