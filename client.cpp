@@ -2,13 +2,16 @@
  * client.cpp
  *
  * This client:
- * - Connects to a specified server IP and port (both taken from command-line args).
- * - Uses a length-prefixed binary protocol with nlohmann::json + MessagePack.
+ * - Connects to a specified server IP and port (command-line).
+ * - Uses a Packet-based wire protocol (no direct nlohmann::json).
  * - Authenticates with the server, then provides commands for listing users,
  *   sending messages, deleting messages, and quitting.
  *
- * Compilation:
- *   g++ -std=c++17 -pthread -I. client.cpp -o client
+ * To compile (with a chosen wire protocol .cpp):
+ *   g++ -std=c++17 -pthread client.cpp custom_wire_protocol.cpp -o client
+ * or
+ *   g++ -std=c++17 -pthread client.cpp json_wire_protocol.cpp -o client
+ *
  * Usage:
  *   ./client <server IP> <port>
  *   Example: ./client 127.0.0.1 54000
@@ -21,7 +24,6 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 
-
 #include <iostream>
 #include <thread>
 #include <string>
@@ -30,175 +32,143 @@
 #include <cerrno>
 #include <cstdlib>
 
-// If you have a single-header "json.hpp", include it like this:
-// #include "json.hpp"
-// Otherwise, if installed system-wide, do:
-// #include <nlohmann/json.hpp>
+// Include the wire protocol declarations: Packet, sendPacket, receivePacket
+#include "wire_protocol.h"
 
-#include "json.hpp"
-using json = nlohmann::json;
-
-// Reads a 4-byte length prefix (network byte order) from the socket, then reads
-// that many bytes into a string. Returns an empty string on error or disconnection.
-std::string readLengthPrefixedData(int sockFd) {
-    std::string buffer;
-    uint32_t lengthNetworkOrder = 0;
-    ssize_t n = recv(sockFd, &lengthNetworkOrder, sizeof(lengthNetworkOrder), 0);
-    if (n <= 0) {
-        return buffer;
-    }
-
-    uint32_t lengthHostOrder = ntohl(lengthNetworkOrder);
-    if (lengthHostOrder == 0) {
-        return buffer;
-    }
-
-    buffer.resize(lengthHostOrder, '\0');
-    size_t totalRead = 0;
-    while (totalRead < lengthHostOrder) {
-        ssize_t chunk = recv(sockFd, &buffer[totalRead], lengthHostOrder - totalRead, 0);
-        if (chunk <= 0) {
-            buffer.clear();
-            return buffer;
-        }
-        totalRead += chunk;
-    }
-    return buffer;
-}
-
-// Reads binary data from the socket, interprets it as MessagePack, and converts
-// it into a JSON object. Returns an empty JSON object if reading or parsing fails.
-json binaryToJson(int sockFd) {
-    std::string data = readLengthPrefixedData(sockFd);
-    if (data.empty()) {
-        return json();
-    }
-    try {
-        std::vector<uint8_t> msgpackData(data.begin(), data.end());
-        return json::from_msgpack(msgpackData);
-    } catch (const std::exception& ex) {
-        std::cerr << "MessagePack parse failed: " << ex.what() << std::endl;
-        return json();
-    }
-}
-
-// Converts a JSON object to MessagePack, sends a 4-byte length prefix, then sends
-// the binary data. Returns true if successfully sent, false on error.
-bool jsonToBinary(int sockFd, const json& j) {
-    try {
-        std::vector<uint8_t> msgpackData = json::to_msgpack(j);
-        uint32_t lengthHostOrder = static_cast<uint32_t>(msgpackData.size());
-        uint32_t lengthNetworkOrder = htonl(lengthHostOrder);
-
-        ssize_t sent = send(sockFd, &lengthNetworkOrder, sizeof(lengthNetworkOrder), 0);
-        if (sent != sizeof(lengthNetworkOrder)) {
-            std::cerr << "Failed to send length prefix." << std::endl;
-            return false;
-        }
-
-        size_t totalSent = 0;
-        while (totalSent < msgpackData.size()) {
-            ssize_t chunk = send(sockFd,
-                                 msgpackData.data() + totalSent,
-                                 msgpackData.size() - totalSent,
-                                 0);
-            if (chunk <= 0) {
-                std::cerr << "Failed to send binary data chunk." << std::endl;
-                return false;
-            }
-            totalSent += chunk;
-        }
-        return true;
-    } catch (const std::exception& ex) {
-        std::cerr << "to_msgpack failed: " << ex.what() << std::endl;
-        return false;
-    }
-}
-
-// Continuously reads JSON messages (as MessagePack) from the server.
-// If reading fails, it ends the thread.
+/*
+ * receiverThreadFunc
+ *
+ * Continuously reads Packets from the server using receivePacket, 
+ * and displays their contents. If reading fails, the thread ends.
+ */
 void receiverThreadFunc(int sockFd) {
     while (true) {
-        json response = binaryToJson(sockFd);
-        if (response.empty()) {
-            std::cout << "Connection closed or read error. Receiver thread ending." << std::endl;
+        Packet pkt = receivePacket(sockFd);
+        if (pkt.fields.empty()) {
+            std::cout << "[INFO] Disconnected or read error. Receiver thread ending.\n";
             break;
         }
-        std::cout << "[SERVER] " << response.dump(2) << std::endl;
+        // Print out the received fields in some structured way
+        auto opIt = pkt.fields.find("op");
+        if (opIt == pkt.fields.end()) {
+            std::cerr << "[WARN] Received Packet missing 'op'.\n";
+            continue;
+        }
+        const std::string &op = opIt->second;
+
+        // Based on "op", decide how to display
+        if (op == "RECEIVE_MSG" || op == "RECEIVE_MSG_OFFLINE") {
+            // e.g. { op="RECEIVE_MSG", from="alice", content="Hello" }
+            std::string from    = pkt.fields.count("from")    ? pkt.fields.at("from")    : "";
+            std::string content = pkt.fields.count("content") ? pkt.fields.at("content") : "";
+            if (op == "RECEIVE_MSG_OFFLINE") {
+                std::cout << "[SERVER] Offline message from " << from << ": " << content << "\n";
+            } else {
+                std::cout << "[SERVER] Message from " << from << ": " << content << "\n";
+            }
+        }
+        else if (op == "LIST_USERS_RES") {
+            // Could be a comma-separated user list or something similar
+            std::string users = pkt.fields.count("users") ? pkt.fields.at("users") : "";
+            std::cout << "[SERVER] Users: " << users << "\n";
+        }
+        else if (op == "CHECK_USER_RES") {
+            bool exists = (pkt.fields.count("exists") && pkt.fields.at("exists") == "true");
+            std::cout << "[SERVER] checkIfUserExists => " << (exists ? "true" : "false") << "\n";
+        }
+        else if (op == "LOGIN_RES" || op == "REGISTER_RES") {
+            std::string status = pkt.fields.count("status") ? pkt.fields.at("status") : "FAIL";
+            std::cout << "[SERVER] " << op << " => status=" << status << "\n";
+        }
+        else if (op == "SEND_MSG_RES" || op == "DELETE_MSG_RES") {
+            std::string st = pkt.fields.count("status") ? pkt.fields.at("status") : "???";
+            std::cout << "[SERVER] " << op << " => " << st << "\n";
+        }
+        else if (op == "ERROR") {
+            std::string message = pkt.fields.count("message") ? pkt.fields.at("message") : "Unknown error";
+            std::cout << "[SERVER] ERROR: " << message << "\n";
+        }
+        else {
+            // fallback
+            std::cout << "[SERVER] Unknown op=" << op << "\n";
+        }
     }
 }
 
-// Prompts the user for a username. Checks if it exists on the server. Then prompts
-// for a password and attempts LOGIN or REGISTER. Returns 0 on success, -1 on failure.
+/*
+ * clientAuthenticate
+ *
+ * Prompts for a username, checks if that user exists,
+ * then prompts for a password and attempts LOGIN or REGISTER.
+ * Returns 0 on success, -1 on failure.
+ */
 int clientAuthenticate(int sockFd) {
     std::cout << "Enter your username: ";
     std::string username;
     std::getline(std::cin, username);
 
-    json checkUserReq;
-    checkUserReq["op"]       = "CHECK_USER";
-    checkUserReq["username"] = username;
-
-    if (!jsonToBinary(sockFd, checkUserReq)) {
-        return -1;
-    }
-
-    json checkUserRes = binaryToJson(sockFd);
-    if (checkUserRes.empty()) {
-        std::cerr << "No response to CHECK_USER." << std::endl;
-        return -1;
-    }
-
-    bool exists = false;
-    try {
-        exists = checkUserRes.at("exists").get<bool>();
-    } catch (...) {
-        std::cerr << "Malformed CHECK_USER response." << std::endl;
-        return -1;
-    }
-
-    std::cout << "Enter your password: ";
-    std::string password;
-    std::getline(std::cin, password);
-
-    json authReq;
-    authReq["op"]       = exists ? "LOGIN" : "REGISTER";
-    authReq["username"] = username;
-    authReq["password"] = password;
-
-    if (!jsonToBinary(sockFd, authReq)) {
-        return -1;
-    }
-
-    json authRes = binaryToJson(sockFd);
-    if (authRes.empty()) {
-        std::cerr << "No response to LOGIN/REGISTER." << std::endl;
-        return -1;
-    }
-
-    try {
-        std::string status = authRes.at("status").get<std::string>();
-        if (status == "SUCCESS") {
-            std::cout << "Authentication successful." << std::endl;
-            return 0;
-        } else {
-            std::cerr << "Authentication failed: " << status << std::endl;
+    // 1) Check if user exists
+    {
+        Packet pkt;
+        pkt.fields["op"]       = "CHECK_USER";
+        pkt.fields["username"] = username;
+        if (!sendPacket(sockFd, pkt)) {
+            std::cerr << "[ERROR] Failed to send CHECK_USER.\n";
             return -1;
         }
-    } catch (...) {
-        std::cerr << "Malformed LOGIN/REGISTER response." << std::endl;
-        return -1;
+        Packet resp = receivePacket(sockFd);
+        if (resp.fields.empty()) {
+            std::cerr << "[ERROR] No response to CHECK_USER.\n";
+            return -1;
+        }
+        // parse "exists"
+        auto exIt = resp.fields.find("exists");
+        bool exists = (exIt != resp.fields.end() && exIt->second == "true");
+
+        // 2) Prompt for password
+        std::cout << "Enter your password: ";
+        std::string password;
+        std::getline(std::cin, password);
+
+        // 3) Send LOGIN or REGISTER
+        Packet authPkt;
+        authPkt.fields["op"]       = exists ? "LOGIN" : "REGISTER";
+        authPkt.fields["username"] = username;
+        authPkt.fields["password"] = password;
+        if (!sendPacket(sockFd, authPkt)) {
+            std::cerr << "[ERROR] Failed to send LOGIN/REGISTER.\n";
+            return -1;
+        }
+        // 4) Wait for response
+        Packet authResp = receivePacket(sockFd);
+        if (authResp.fields.empty()) {
+            std::cerr << "[ERROR] No response to LOGIN/REGISTER.\n";
+            return -1;
+        }
+        auto stIt = authResp.fields.find("status");
+        if (stIt == authResp.fields.end()) {
+            std::cerr << "[ERROR] Malformed LOGIN/REGISTER response.\n";
+            return -1;
+        }
+        if (stIt->second == "SUCCESS") {
+            std::cout << "Authentication successful.\n";
+            return 0;
+        } else {
+            std::cerr << "Authentication failed: " << stIt->second << "\n";
+            return -1;
+        }
     }
 }
 
 int main(int argc, char** argv) {
     if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <server IP> <port>" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <server IP> <port>\n";
         return 1;
     }
-    const char* serverIP = argv[1];
+    const char* serverIP   = argv[1];
     const char* serverPort = argv[2];
 
+    // 1) Resolve server
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family   = AF_INET;
@@ -207,38 +177,40 @@ int main(int argc, char** argv) {
     struct addrinfo* addrResult = nullptr;
     int rv = getaddrinfo(serverIP, serverPort, &hints, &addrResult);
     if (rv != 0) {
-        std::cerr << "getaddrinfo: " << gai_strerror(rv) << std::endl;
+        std::cerr << "[ERROR] getaddrinfo: " << gai_strerror(rv) << "\n";
         return 1;
     }
 
-    int clientSock = -1;
+    int sockFd = -1;
     for (auto p = addrResult; p != nullptr; p = p->ai_next) {
-        clientSock = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        if (clientSock == -1) {
-            continue;
-        }
-        if (connect(clientSock, p->ai_addr, p->ai_addrlen) == 0) {
+        sockFd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (sockFd == -1) continue;
+        if (connect(sockFd, p->ai_addr, p->ai_addrlen) == 0) {
+            // success
             break;
         }
-        close(clientSock);
-        clientSock = -1;
+        close(sockFd);
+        sockFd = -1;
     }
     freeaddrinfo(addrResult);
 
-    if (clientSock == -1) {
-        std::cerr << "Unable to connect to " << serverIP << ":" << serverPort << std::endl;
+    if (sockFd == -1) {
+        std::cerr << "[ERROR] Unable to connect to " << serverIP << ":" << serverPort << "\n";
         return 1;
     }
-    std::cout << "Connected to " << serverIP << " on port " << serverPort << std::endl;
+    std::cout << "[INFO] Connected to " << serverIP << ":" << serverPort << "\n";
 
-    if (clientAuthenticate(clientSock) != 0) {
-        std::cerr << "Authentication failed. Exiting." << std::endl;
-        close(clientSock);
+    // 2) Perform authentication
+    if (clientAuthenticate(sockFd) != 0) {
+        std::cerr << "[ERROR] Authentication failed. Exiting.\n";
+        close(sockFd);
         return 1;
     }
 
-    std::thread receiver(receiverThreadFunc, clientSock);
+    // 3) Start receiver thread
+    std::thread receiver(receiverThreadFunc, sockFd);
 
+    // 4) Main loop: commands
     while (true) {
         std::cout << "\nCommands:\n"
                   << "  L: list users\n"
@@ -246,56 +218,60 @@ int main(int argc, char** argv) {
                   << "  D: delete messages\n"
                   << "  Q: quit\n"
                   << "Enter Command: ";
-
         std::string command;
         if (!std::getline(std::cin, command)) {
+            // input ended
             break;
         }
 
         if (command == "Q" || command == "q") {
-            json quitMsg;
-            quitMsg["op"] = "QUIT";
-            jsonToBinary(clientSock, quitMsg);
+            Packet pkt;
+            pkt.fields["op"] = "QUIT";
+            sendPacket(sockFd, pkt);
             break;
-        } else if (command == "L" || command == "l") {
+        }
+        else if (command == "L" || command == "l") {
             std::cout << "Enter search term (blank for all): ";
-            std::string searchTerm;
-            std::getline(std::cin, searchTerm);
-
-            json listReq;
-            listReq["op"]     = "LIST_USERS";
-            listReq["search"] = searchTerm;
-            jsonToBinary(clientSock, listReq);
-        } else if (command == "S" || command == "s") {
+            std::string st;
+            std::getline(std::cin, st);
+            Packet pkt;
+            pkt.fields["op"]     = "LIST_USERS";
+            pkt.fields["search"] = st;
+            sendPacket(sockFd, pkt);
+        }
+        else if (command == "S" || command == "s") {
             std::cout << "Recipient username: ";
             std::string recipient;
             std::getline(std::cin, recipient);
 
             std::cout << "Message text: ";
-            std::string msgText;
-            std::getline(std::cin, msgText);
+            std::string text;
+            std::getline(std::cin, text);
 
-            json sendReq;
-            sendReq["op"]        = "SEND_MSG";
-            sendReq["recipient"] = recipient;
-            sendReq["content"]   = msgText;
-            jsonToBinary(clientSock, sendReq);
-        } else if (command == "D" || command == "d") {
+            Packet pkt;
+            pkt.fields["op"]        = "SEND_MSG";
+            pkt.fields["recipient"] = recipient;
+            pkt.fields["content"]   = text;
+            sendPacket(sockFd, pkt);
+        }
+        else if (command == "D" || command == "d") {
             std::cout << "Enter message ID(s) to delete: ";
-            std::string msgIds;
-            std::getline(std::cin, msgIds);
+            std::string ids;
+            std::getline(std::cin, ids);
 
-            json deleteReq;
-            deleteReq["op"]  = "DELETE_MSG";
-            deleteReq["ids"] = msgIds;
-            jsonToBinary(clientSock, deleteReq);
-        } else {
-            std::cerr << "Unrecognized command." << std::endl;
+            Packet pkt;
+            pkt.fields["op"]  = "DELETE_MSG";
+            pkt.fields["ids"] = ids;
+            sendPacket(sockFd, pkt);
+        }
+        else {
+            std::cerr << "[WARN] Unrecognized command.\n";
         }
     }
 
-    close(clientSock);
+    // Cleanup
+    close(sockFd);
     receiver.join();
-    std::cout << "Client terminated." << std::endl;
+    std::cout << "[INFO] Client terminated.\n";
     return 0;
 }
