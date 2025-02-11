@@ -1,332 +1,245 @@
 /*
- * chat_server.cpp
+ * server.cpp
  *
- * A simple chat server using POSIX sockets in C++.
+ * This server:
+ * - Accepts a port number from the command line (default = 54000 if omitted).
+ * - Listens for incoming client connections.
+ * - Spawns a thread for each client.
+ * - Uses a length-prefixed binary protocol with nlohmann::json + MessagePack.
  *
- * This server listens on a specified port and accepts client connections.
- * Each client must first register by sending a message of the form:
- *    REGISTER <uuid>
+ * Compilation:
+ *   clang++ -std=c++17 -pthread -I server.cpp -o server
  *
- * Once registered, the client can send messages using the format:
- *    SEND <destination_uuid> <message>
- *
- * The server checks if the destination client is currently connected:
- *   - If so, it immediately forwards the message.
- *   - Otherwise, it stores the message as an “offline message” and sends it
- *     when the recipient later connects.
- *
- * To compile:
- *    g++ chat_server.cpp -o chat_server -pthread
+ * Usage:
+ *   ./server <port>
+ *   If <port> is omitted, defaults to 54000.
  */
 
 #include <iostream>
-#include <sys/socket.h>      // For socket functions
-#include <netinet/in.h>      // For sockaddr_in
-#include <arpa/inet.h>       // For inet_ntoa and htons
-#include <unistd.h>          // For close()
-#include <cstring>
-#include <sstream>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 #include <mutex>
-#include <algorithm>
+#include <string>
+#include <cstring>
+#include <cerrno>
+#include <cstdlib>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <netdb.h>
+#include "json.hpp"
 
-const int PORT = 54000; // Server listening port
+using json = nlohmann::json;
 
-// Global data structures to keep track of connected clients and offline messages
+// Data Structures
 
-// Map from client username to password hash
-std::unordered_map<std::string, std::string> userRecord;
-std::mutex userMutex;
+struct UserInfo {
+    std::string password;
+    bool isOnline = false;
+    int socketFd = -1;
+    std::vector<std::string> offlineMessages;
+};
 
-// Map from client username to its socket descriptor
-std::unordered_map<std::string, int> connectedClients;
-std::mutex clientsMutex;
+static std::unordered_map<std::string, UserInfo> userMap;
+static std::mutex userMapMutex;
 
-// Map from client username to a list of messages that arrived while offline
-std::unordered_map<std::string, std::vector<std::string>> offlineMessages;
-std::mutex offlineMutex;
+// Binary/JSON Functions
 
-
-/*
-user_authenticate
-
-Takes client socket and manages authentication.
-If submitted username does not yet exist, create and request password. 
-If username does exist, verify password matches.
-
-Return 0 if user creation/auth successful, -1 otherwise.
-*/
-int user_authenticate(int clientSocket, char* buffer) {
-    // Assume buffer is at least 1024 bytes
-    const size_t bufSize = 1024;
-    
-    // --- Step 1: Receive Username ---
-    std::cout << "Waiting for username" << std::endl;
-    memset(buffer, 0, bufSize);  // Clear buffer
-    int bytesReceived = recv(clientSocket, buffer, bufSize - 1, 0);
+// Reads a 4-byte length prefix from the socket, then reads the exact number of bytes
+// indicated by that length. Returns the binary data as a string. If an error occurs,
+// an empty string is returned.
+std::string readLengthPrefixedData(int sockFd) {
+    std::string buffer;
+    uint32_t lengthNetworkOrder = 0;
+    ssize_t bytesReceived = recv(sockFd, &lengthNetworkOrder, sizeof(lengthNetworkOrder), 0);
     if (bytesReceived <= 0) {
-        std::cerr << "Username reception error (socket)" << std::endl;
-        close(clientSocket);
-        return -1;
+        return buffer;
     }
-    buffer[bytesReceived] = '\0';
-    std::string username(buffer);
-    
-    // --- Step 2: Decide if user exists ---
-    bool userExists = false;
-    {
-        std::lock_guard<std::mutex> lock(userMutex);
-        userExists = (userRecord.find(username) != userRecord.end());
+
+    uint32_t lengthHostOrder = ntohl(lengthNetworkOrder);
+    if (lengthHostOrder == 0) {
+        return buffer;
     }
-    
-    std::string responseMessage;
-    if (userExists) {
-        std::cout << "User exists: " << username << std::endl;
-        responseMessage = "AUTHENTICATE";
-    } else {
-        std::cout << "User not found: " << username << std::endl;
-        responseMessage = "REGISTER";
+
+    buffer.resize(lengthHostOrder, '\0');
+    size_t totalRead = 0;
+    while (totalRead < lengthHostOrder) {
+        ssize_t chunk = recv(sockFd, &buffer[totalRead], lengthHostOrder - totalRead, 0);
+        if (chunk <= 0) {
+            buffer.clear();
+            return buffer;
+        }
+        totalRead += chunk;
     }
-    
-    // --- Step 3: Send response to client ---
-    send(clientSocket, responseMessage.c_str(), responseMessage.size(), 0);
-    
-    // --- Step 4: Receive Password ---
-    std::cout << "Waiting for password" << std::endl;
-    memset(buffer, 0, bufSize);  // Clear buffer again
-    bytesReceived = recv(clientSocket, buffer, bufSize - 1, 0);
-    if (bytesReceived <= 0) {
-        std::cerr << "Password reception error (socket)" << std::endl;
-        close(clientSocket);
-        return -1;
+    return buffer;
+}
+
+// Reads binary data from the socket, interprets it as MessagePack, and converts it into a JSON object.
+// If an error occurs during reading or parsing, an empty JSON object is returned.
+json binaryToJson(int sockFd) {
+    std::string data = readLengthPrefixedData(sockFd);
+    if (data.empty()) {
+        return json();
     }
-    buffer[bytesReceived] = '\0';
-    std::string password(buffer);
-    
-    // --- Step 5: Process based on previous decision ---
-    {
-        std::lock_guard<std::mutex> lock(userMutex);
-        if (userExists) {
-            // Authentication case: verify password matches stored password.
-            if (userRecord[username] == password) {
-                std::string authSuccessMessage = "AUTH_SUCCESS";
-                send(clientSocket, authSuccessMessage.c_str(), authSuccessMessage.size(), 0);
-                std::cout << "User authenticated: " << username << std::endl;
-            } else {
-                std::string authFailureMessage = "AUTH_FAILURE";
-                send(clientSocket, authFailureMessage.c_str(), authFailureMessage.size(), 0);
-                std::cerr << "User authentication failed: " << username << std::endl;
-                close(clientSocket);
-                return -1;
+    try {
+        std::vector<uint8_t> msgpackData(data.begin(), data.end());
+        return json::from_msgpack(msgpackData);
+    } catch (const std::exception& ex) {
+        std::cerr << "MessagePack parse failed: " << ex.what() << std::endl;
+        return json();
+    }
+}
+
+// Converts a JSON object to MessagePack format, sends a 4-byte length prefix, then sends the binary data.
+// Returns true if the entire message is sent successfully, otherwise returns false.
+bool jsonToBinary(int sockFd, const json& j) {
+    try {
+        std::vector<uint8_t> msgpackData = json::to_msgpack(j);
+        uint32_t lengthHostOrder = static_cast<uint32_t>(msgpackData.size());
+        uint32_t lengthNetworkOrder = htonl(lengthHostOrder);
+
+        ssize_t sent = send(sockFd, &lengthNetworkOrder, sizeof(lengthNetworkOrder), 0);
+        if (sent != sizeof(lengthNetworkOrder)) {
+            std::cerr << "Failed to send length prefix." << std::endl;
+            return false;
+        }
+
+        size_t totalSent = 0;
+        while (totalSent < msgpackData.size()) {
+            ssize_t chunk = send(sockFd, msgpackData.data() + totalSent, msgpackData.size() - totalSent, 0);
+            if (chunk <= 0) {
+                std::cerr << "Failed to send binary data chunk." << std::endl;
+                return false;
             }
-        } else {
-            // Registration case: add the username and password to the record.
-            // (In a real-world scenario, hash the password before storing.)
-            userRecord[username] = password;
-            std::string regSuccessMessage = "REG_SUCCESS";
-            send(clientSocket, regSuccessMessage.c_str(), regSuccessMessage.size(), 0);
-            std::cout << "User registered: " << username << std::endl;
+            totalSent += chunk;
         }
+        return true;
+    } catch (const std::exception& ex) {
+        std::cerr << "to_msgpack failed: " << ex.what() << std::endl;
+        return false;
     }
-
-    // Add this client to the map of connected clients
-    {
-        std::lock_guard<std::mutex> lock(clientsMutex);
-        connectedClients[username] = clientSocket;
-    }
-    
-    return 0;
 }
 
-/*
-list_users
+// Helper Functions
 
-Takes a client socket as input.
-
-Prompts user for wildcard and sends all matching accounts.
-
-Return -1 if error, 0 otherwise.
-*/
-
-int list_users(int clientSocket, const std::string &searchTerm) {
-    std::string result;
+// Sends all stored offline messages for a user. After sending, the messages are cleared.
+void deliverOfflineMessages(const std::string& username, int sockFd) {
+    std::vector<std::string> messages;
     {
-        std::lock_guard<std::mutex> lock(userMutex);
-        for (const auto &pair : userRecord) {
-            const std::string &username = pair.first;
-            if (username.find(searchTerm) != std::string::npos) {
-                result += username + "\n";
+        std::lock_guard<std::mutex> lock(userMapMutex);
+        auto it = userMap.find(username);
+        if (it == userMap.end()) {
+            return;
+        }
+        messages = std::move(it->second.offlineMessages);
+        it->second.offlineMessages.clear();
+    }
+
+    for (const auto& msg : messages) {
+        json j;
+        j["op"] = "RECEIVE_MSG_OFFLINE";
+        j["content"] = msg;
+        jsonToBinary(sockFd, j);
+    }
+}
+
+// Checks if a username exists in userMap and sends a response indicating whether it exists.
+bool checkIfUserExists(int sockFd, const std::string& username) {
+    bool exists = false;
+    {
+        std::lock_guard<std::mutex> lock(userMapMutex);
+        exists = (userMap.find(username) != userMap.end());
+    }
+    json response;
+    response["op"] = "CHECK_USER_RES";
+    response["exists"] = exists;
+    return jsonToBinary(sockFd, response);
+}
+
+// Handles login or registration. If successful, the user is marked online and any offline messages are delivered.
+bool loginOrRegister(int sockFd, const std::string& username, const std::string& password, const std::string& op) {
+    bool success = false;
+    std::string status = "FAIL";
+
+    {
+        std::lock_guard<std::mutex> lock(userMapMutex);
+        if (op == "LOGIN") {
+            auto it = userMap.find(username);
+            if (it != userMap.end() && it->second.password == password) {
+                it->second.isOnline = true;
+                it->second.socketFd = sockFd;
+                success = true;
+                status = "SUCCESS";
+            }
+        } else if (op == "REGISTER") {
+            auto it = userMap.find(username);
+            if (it == userMap.end()) {
+                UserInfo newUser;
+                newUser.password = password;
+                newUser.isOnline = true;
+                newUser.socketFd = sockFd;
+                userMap[username] = std::move(newUser);
+                success = true;
+                status = "SUCCESS";
             }
         }
     }
-    
-    if (result.empty()) {
-        result = "No matching users found.\n";
+
+    json response;
+    response["op"] = (op == "LOGIN") ? "LOGIN_RES" : "REGISTER_RES";
+    response["status"] = status;
+    bool ok = jsonToBinary(sockFd, response);
+
+    if (success) {
+        deliverOfflineMessages(username, sockFd);
     }
-    
-    if (send(clientSocket, result.c_str(), result.size(), 0) == -1) {
-        std::cerr << "Error sending matching users." << std::endl;
-        return -1;
-    }
-    return 0;
+    return ok;
 }
 
+// Thread Function
 
+// Runs in a thread, continuously handling client requests. Breaks on "QUIT" or disconnection.
+void handleClient(int sockFd) {
+    std::string currentUser;
+    bool isAuthenticated = false;
 
-
-/* 
-send_message
-
-Takes client socket as input.
-
-Prompts user for an account. Delivers or queues depending
-on whether the user is connected or not.
-*/
-
-int send_message(int clientSocket) {
-    // TODO: Implement send_message functionality
-    std::string response = "Sending message...\n";
-    send(clientSocket, response.c_str(), response.size(), 0);
-    return 0;
-}
-
-/*
-delete_messages
-
-Takes client socket as input.
-
-*/
-
-int delete_messages(int clientSocket) {
-    // TODO: Implement delete_messages functionality
-    std::string response = "Deleting messages...\n";
-    send(clientSocket, response.c_str(), response.size(), 0);
-    return 0;
-}
-
-/*
-handle_client
-
-Takes client socket as input and manages client thread.
-Uses user_authenticate and send_message function to deliver functionality.
-*/
-void handle_client(int clientSocket) {
-    char buffer[1024];
-
-    // Step 1: Authenticate the user.
-    if (user_authenticate(clientSocket, buffer) < 0) {
-        close(clientSocket);
-        return;
-    }
-
-    // Step 2: Enter a loop to receive new commands.
     while (true) {
-        memset(buffer, 0, sizeof(buffer));
-        int bytesReceived = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
-        if (bytesReceived <= 0) {
-            std::cerr << "Error receiving command or client disconnected." << std::endl;
-            break; // Exit loop if error or client disconnects.
+        json request = binaryToJson(sockFd);
+        if (request.empty()) {
+            std::cout << "Client disconnected or error." << std::endl;
+            break;
         }
-        buffer[bytesReceived] = '\0';
 
-        // Convert the received command to a string.
-        std::string command(buffer);
-        // Remove potential trailing newline or whitespace (if needed)
-        command.erase(std::remove(command.begin(), command.end(), '\n'), command.end());
-        command.erase(std::remove(command.begin(), command.end(), '\r'), command.end());
-
-        // Check which command was received.
-        if (command.size() >= 1 && command[0] == 'L') {
-            // Expect the command in the format: "L <searchTerm>"
-            std::string searchTerm = command.substr(1);
-            // Trim any leading spaces:
-            searchTerm.erase(0, searchTerm.find_first_not_of(" \t"));
-            std::cout << "List users command received with search term: \"" << searchTerm << "\"" << std::endl;
-            list_users(clientSocket, searchTerm);
-        } else if (command == "S") {
-            std::cout << "Send message command received." << std::endl;
-            send_message(clientSocket);
-        } else if (command == "D") {
-            std::cout << "Delete messages command received." << std::endl;
-            delete_messages(clientSocket);
-        } else if (command == "Q") {
-            std::cout << "Quit command received. Closing connection." << std::endl;
-            break; // Optional: exit on "Q" for quit.
-        } else {
-            std::cerr << "Invalid command received: " << command << std::endl;
-            std::string errMsg = "INVALID COMMAND\n";
-            send(clientSocket, errMsg.c_str(), errMsg.size(), 0);
-        }
-    }
-    
-    // Clean up and close the client socket.
-    close(clientSocket);
-}
-
-
-
-
-/*
- * main
- *
- * Sets up the server socket, binds to the desired port, and listens for
- * incoming client connections. Each new client is handled in a separate thread.
- */
-int main() {
-    // Create a TCP socket (IPv4, stream socket)
-    int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (serverSocket == -1) {
-        perror("socket failed");
-        exit(EXIT_FAILURE);
-    }
-    
-    // Allow the port to be reused immediately after the program terminates
-    int opt = 1;
-    if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        perror("setsockopt");
-        exit(EXIT_FAILURE);
-    }
-    
-    // Set up the server address structure
-    sockaddr_in serverAddress;
-    serverAddress.sin_family = AF_INET;
-    serverAddress.sin_addr.s_addr = INADDR_ANY; // Listen on all network interfaces
-    serverAddress.sin_port = htons(PORT);       // Convert port to network byte order
-    
-    // Bind the socket to the address and port
-    if (bind(serverSocket, (struct sockaddr*)&serverAddress, sizeof(serverAddress)) < 0) {
-        perror("bind failed");
-        exit(EXIT_FAILURE);
-    }
-    
-    // Start listening for incoming connections
-    if (listen(serverSocket, SOMAXCONN) < 0) {
-        perror("listen");
-        exit(EXIT_FAILURE);
-    }
-    
-    std::cout << "Server listening on port " << PORT << "..." << std::endl;
-    
-    // Continuously accept new client connections
-    while (true) {
-        sockaddr_in clientAddress;
-        socklen_t clientAddressLen = sizeof(clientAddress);
-        int clientSocket = accept(serverSocket, (struct sockaddr*)&clientAddress, &clientAddressLen);
-        if (clientSocket < 0) {
-            perror("accept");
+        std::string op;
+        try {
+            op = request.at("op").get<std::string>();
+        } catch (...) {
+            std::cerr << "JSON does not have 'op' field." << std::endl;
             continue;
         }
 
-        std::cout << "Launching client thread." << std::endl;
-        
-        // Launch a new thread to handle the connected client
-        std::thread clientThread(handle_client, clientSocket);
-        clientThread.detach(); // Detach so that the thread cleans up on its own
+        if (op == "CHECK_USER") {
+            std::string uname = request.value("username", "");
+            if (!uname.empty()) {
+                checkIfUserExists(sockFd, uname);
+            }
+        } else if (op == "LOGIN" || op == "REGISTER") {
+            std::string uname = request.value("username", "");
+            std::string pwd = request.value("password", "");
+            if (!uname.empty() && !pwd.empty()) {
+                loginOrRegister(sockFd, uname, pwd, op);
+            }
+        } else if (op == "QUIT") {
+            break;
+        }
     }
-    
-    // Close the server socket (this line is not reached in this example)
-    close(serverSocket);
-    return 0;
+
+    close(sockFd);
+}
+
+int main(int argc, char* argv[]) {
+    std::cout << "Server is running..." << std::endl;
 }
