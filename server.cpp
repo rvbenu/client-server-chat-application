@@ -33,8 +33,8 @@
 #include <netdb.h>
 
 // Argon2 and OpenSSL RAND
-#include "argon2.h"
-#include "rand.h"
+#include <argon2.h>
+#include <openssl/rand.h>
 
 // Our wire protocol interface (Packet struct, sendPacket, receivePacket)
 #include "wire_protocol.h"
