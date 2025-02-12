@@ -1,0 +1,28 @@
+Sat Feb 8 Ruben
+
+Used getaddrinfo() to find a feasible address to establish a connection between cleint and server. 
+
+`server.cpp` and `client.cpp` assume the messages sent will be short for now. 
+TO-DO: When larger messages are sent, they must be broken down. This is to be implemented. 
+
+
+
+
+
+
+
+Sat Feb 9 Ruben 
+
+In `server.cpp`, connections are continuously being accepted by using an 
+infinite loop. When a connection is accepted, a thread is crated. Function 
+`manage_client_communication` manages client communication independently.
+The thread is detached. 
+
+Created files for the class UserAccount.  
+TO-DO: The `hash_function` for passwords must be implemented.  
+
+So far, the TCP connection with sockets is pretty much managed by the current code. 
+Next, the validation of usernames and passwords must be implemented and the way 
+the server and client will communicate about this must be implemented as well. 
+
+Check comments in server.cpp and client.cpp for more details. 
