@@ -1,10 +1,11 @@
 #include "json_wire_protocol.h"
 #include <iostream>
-#include <stdexcept>
 #include <cstring>       // For memset
 #include "json.hpp"
 
-// Helper: send all data
+/**
+ * @brief Helper function to send all data in a loop until fully transmitted or error.
+ */
 static ssize_t sendAll(Socket sock, const uint8_t* data, size_t length) {
     size_t totalSent = 0;
     while (totalSent < length) {
@@ -18,7 +19,9 @@ static ssize_t sendAll(Socket sock, const uint8_t* data, size_t length) {
     return totalSent;
 }
 
-// Helper: recv all data
+/**
+ * @brief Helper function to receive all data in a loop until fully read or error.
+ */
 static ssize_t recvAll(Socket sock, uint8_t* data, size_t length) {
     size_t totalReceived = 0;
     while (totalReceived < length) {
@@ -36,92 +39,90 @@ static ssize_t recvAll(Socket sock, uint8_t* data, size_t length) {
     return totalReceived;
 }
 
-std::vector<uint8_t> serializePacket(const BasePacket& pkt) {
-    // Convert to JSON
-    nlohmann::json j = pkt.to_json();
+/**
+ * @brief Serialize a Packet to a binary buffer (MessagePack) using nlohmann::json.
+ */
+std::vector<uint8_t> serializePacket(const Packet& pkt) {
+    // 1) Convert Packet fields to nlohmann::json
+    nlohmann::json j;
+    j["op_code"]     = std::string(1, pkt.op_code);
+    j["username"]    = pkt.username;
+    j["password"]    = pkt.password;
+    j["sender"]      = pkt.sender;
+    j["recipient"]   = pkt.recipient;
+    j["message"]     = pkt.message;
+    j["message_id"]  = pkt.message_id;
+    j["isValidated"] = pkt.isValidated;
 
-    // to_msgpack/binary
+    // 2) Convert JSON -> MessagePack
     std::vector<uint8_t> msgpackData = nlohmann::json::to_msgpack(j);
     return msgpackData;
 }
 
-std::unique_ptr<BasePacket> deserializePacket(const std::vector<uint8_t>& data) {
-    // from_msgpack -> JSON
+/**
+ * @brief Deserialize a binary buffer (MessagePack) into a Packet object.
+ */
+std::unique_ptr<Packet> deserializePacket(const std::vector<uint8_t>& data) {
+    // 1) Convert MessagePack -> JSON
     nlohmann::json j = nlohmann::json::from_msgpack(data);
 
-    // Check "op_code"
-    if (!j.contains("op_code") || !j["op_code"].is_string()) {
-        throw std::runtime_error("Invalid or missing 'op_code'");
-    }
-    std::string code = j["op_code"].get<std::string>();
-    if (code.size() != 1) {
-        throw std::runtime_error("op_code must be a single character.");
-    }
-    char op = code[0];
+    // 2) Construct a Packet and populate
+    auto pkt = std::make_unique<Packet>();
 
-    std::unique_ptr<BasePacket> packet;
-    switch (op) {
-    case 'L': {
-        auto p = std::make_unique<LoginPacket>();
-        p->from_json(j);
-        packet = std::move(p);
-        break;
+    // op_code
+    if (j.contains("op_code") && j["op_code"].is_string()) {
+        std::string opStr = j["op_code"].get<std::string>();
+        if (!opStr.empty()) {
+            pkt->op_code = opStr[0];
+        }
     }
-    case 'R': {
-        auto p = std::make_unique<RegisterPacket>();
-        p->from_json(j);
-        packet = std::move(p);
-        break;
+    // username
+    if (j.contains("username")) {
+        pkt->username = j["username"].get<std::string>();
     }
-    case 's': {
-        auto p = std::make_unique<SendPacket>();
-        p->from_json(j);
-        packet = std::move(p);
-        break;
+    // password
+    if (j.contains("password")) {
+        pkt->password = j["password"].get<std::string>();
     }
-    case 'd': {
-        auto p = std::make_unique<DeletePacket>();
-        p->from_json(j);
-        packet = std::move(p);
-        break;
+    // sender
+    if (j.contains("sender")) {
+        pkt->sender = j["sender"].get<std::string>();
     }
-    case 'l': {
-        auto p = std::make_unique<ListUsersPacket>();
-        p->from_json(j);
-        packet = std::move(p);
-        break;
+    // recipient
+    if (j.contains("recipient")) {
+        pkt->recipient = j["recipient"].get<std::string>();
     }
-    case 'q': {
-        auto p = std::make_unique<QuitPacket>();
-        p->from_json(j);
-        packet = std::move(p);
-        break;
+    // message
+    if (j.contains("message")) {
+        pkt->message = j["message"].get<std::string>();
     }
-    case 'v': {
-        // ValidatePacket
-        auto p = std::make_unique<ValidatePacket>();
-        p->from_json(j);
-        packet = std::move(p);
-        break;
+    // message_id
+    if (j.contains("message_id")) {
+        pkt->message_id = j["message_id"].get<std::string>();
     }
-    default:
-        throw std::runtime_error("Unknown op_code: " + code);
+    // isValidated
+    if (j.contains("isValidated")) {
+        pkt->isValidated = j["isValidated"].get<bool>();
     }
-    return packet;
+
+    return pkt;
 }
 
-int sendPacket(Socket socket, const BasePacket& pkt) {
+/**
+ * @brief Send a Packet over a socket with a 4-byte size prefix.
+ */
+int sendPacket(Socket socket, const Packet& pkt) {
     try {
-        // Serialize
+        // Serialize the Packet
         std::vector<uint8_t> data = serializePacket(pkt);
 
-        // Send size prefix (4 bytes, network order)
+        // Send size header (4 bytes in network byte order)
         uint32_t netSize = htonl(static_cast<uint32_t>(data.size()));
         if (sendAll(socket, reinterpret_cast<const uint8_t*>(&netSize), 4) != 4) {
             return FAILURE;
         }
 
-        // Send the data
+        // Send actual data
         ssize_t sent = sendAll(socket, data.data(), data.size());
         if (sent != static_cast<ssize_t>(data.size())) {
             return FAILURE;
@@ -133,24 +134,27 @@ int sendPacket(Socket socket, const BasePacket& pkt) {
     }
 }
 
-std::unique_ptr<BasePacket> receivePacket(Socket socket) {
-    // Read 4-byte size
+/**
+ * @brief Receive a Packet from a socket with a 4-byte size prefix.
+ */
+std::unique_ptr<Packet> receivePacket(Socket socket) {
+    // Read the size header (4 bytes)
     uint32_t netSize = 0;
     if (recvAll(socket, reinterpret_cast<uint8_t*>(&netSize), 4) != 4) {
-        return nullptr;
+        return nullptr; // error or disconnect
     }
     uint32_t dataSize = ntohl(netSize);
     if (dataSize == 0) {
-        return nullptr;
+        return nullptr; // Possibly empty or error
     }
 
-    // Read data
+    // Read the actual data
     std::vector<uint8_t> buffer(dataSize);
     if (recvAll(socket, buffer.data(), dataSize) != static_cast<ssize_t>(dataSize)) {
-        return nullptr;
+        return nullptr; // error or disconnect
     }
 
-    // Deserialize
+    // Deserialize into a Packet
     try {
         return deserializePacket(buffer);
     } catch (const std::exception& e) {

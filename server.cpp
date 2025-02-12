@@ -14,7 +14,10 @@
 #include <unistd.h>
 #include <netdb.h>
 
+// User authentication (argon2CheckPassword, argon2HashPassword, etc.)
 #include "user_auth/user_auth.h"
+
+// The new unified Packet class and JSON wire protocol
 #include "wire_protocol/json_wire_protocol.h"
 
 /**
@@ -56,9 +59,9 @@ bool userRegister(int sockFd, const std::string &initialUsername,
 
 /**
  * @brief Attempt to log in the user in a loop:
- *  1) If user exists and password matches, send ValidatePacket(isValidated=true), mark online, return true.
- *  2) Otherwise, send ValidatePacket(isValidated=false).
- *     Then expect another packet (could be another LoginPacket, or a RegisterPacket, etc.).
+ *  1) If user exists and password matches, send Packet(op_code='v', isValidated=true), mark online, return true.
+ *  2) Otherwise, send Packet(op_code='v', isValidated=false).
+ *     Then expect another packet (could be another Packet with op_code='L' or 'R').
  *     If 'R', calls userRegister; if 'L', tries login again; if no packet or error, return false.
  */
 bool userLogin(int sockFd, const std::string &initialUsername,
@@ -83,8 +86,9 @@ bool userLogin(int sockFd, const std::string &initialUsername,
             }
         }
 
-        // Send ValidatePacket with success/fail
-        ValidatePacket v;
+        // Send Packet with op_code='v' to indicate validation result
+        Packet v;
+        v.op_code = 'v';        // validate op code
         v.isValidated = success;
         sendPacket(sockFd, v);
 
@@ -100,12 +104,10 @@ bool userLogin(int sockFd, const std::string &initialUsername,
                     std::cout << "[INFO] " << username << " has " 
                               << offlineCount << " offline messages.\n";
 
-                    // Wait 2 seconds
-                    // std::this_thread::sleep_for(std::chrono::seconds(2));
-
-                    // Deliver each offline message as a SendPacket
+                    // Deliver each offline message as a Packet with op_code='s'
                     for (const auto &offMsg : info.offlineMessages) {
-                        SendPacket forwardPkt;
+                        Packet forwardPkt;
+                        forwardPkt.op_code   = 's';
                         forwardPkt.sender    = offMsg.sender;
                         forwardPkt.recipient = offMsg.recipient;
                         forwardPkt.message   = offMsg.content;
@@ -128,15 +130,15 @@ bool userLogin(int sockFd, const std::string &initialUsername,
             std::cerr << "[WARN] userLogin: client disconnected.\n";
             return false; 
         }
-        char nextOp = nextPkt->getOpCode();
+        char nextOp = nextPkt->op_code;
         if (nextOp == 'L') {
             // Another login attempt
-            username = nextPkt->getUsername();
-            password = nextPkt->getPassword();
+            username = nextPkt->username;
+            password = nextPkt->password;
         } else if (nextOp == 'R') {
             // Switch to register
-            std::string uname = nextPkt->getUsername();
-            std::string pwd   = nextPkt->getPassword();
+            std::string uname = nextPkt->username;
+            std::string pwd   = nextPkt->password;
             if (userRegister(sockFd, uname, pwd, nextOp)) {
                 return true;
             } else {
@@ -150,13 +152,11 @@ bool userLogin(int sockFd, const std::string &initialUsername,
 }
 
 
-
-
 /**
  * @brief Attempt to register the user in a loop:
- *  1) If username is available, store user in userMap, send ValidatePacket(isValidated=true), and return true.
- *  2) Otherwise, send ValidatePacket(isValidated=false).
- *     Then expect next packet. Could be another RegisterPacket or a LoginPacket, etc.
+ *  1) If username is available, store user in userMap, send Packet(op_code='v', isValidated=true), and return true.
+ *  2) Otherwise, send Packet(op_code='v', isValidated=false).
+ *     Then expect next packet. Could be a Packet with op_code='R' or 'L', etc.
  */
 bool userRegister(int sockFd, const std::string &initialUsername,
                   const std::string &initialPassword, char opCode)
@@ -180,7 +180,9 @@ bool userRegister(int sockFd, const std::string &initialUsername,
             }
         }
 
-        ValidatePacket v;
+        // Send Packet(op_code='v') for validation
+        Packet v;
+        v.op_code    = 'v';
         v.isValidated = success;
         sendPacket(sockFd, v);
 
@@ -195,13 +197,13 @@ bool userRegister(int sockFd, const std::string &initialUsername,
             std::cerr << "[WARN] userRegister: client disconnected.\n";
             return false;
         }
-        char nextOp = nextPkt->getOpCode();
+        char nextOp = nextPkt->op_code;
         if (nextOp == 'R') {
-            username = nextPkt->getUsername();
-            password = nextPkt->getPassword();
+            username = nextPkt->username;
+            password = nextPkt->password;
         } else if (nextOp == 'L') {
-            std::string uname = nextPkt->getUsername();
-            std::string pwd   = nextPkt->getPassword();
+            std::string uname = nextPkt->username;
+            std::string pwd   = nextPkt->password;
             if (userLogin(sockFd, uname, pwd, nextOp)) {
                 return true;
             } else {
@@ -214,61 +216,73 @@ bool userRegister(int sockFd, const std::string &initialUsername,
     }
 }
 
+
 /**
- * @brief Main per-client loop.
+ * @brief This function is called in a thread in main to handle 
+ * each client independently. Takes the socket file descriptor 
+ * of the connection as an argument. 
  */
 void handleClient(int sockFd) {
-    bool isAuthenticated = false;
-    std::string currentUser;
+    bool isAuthenticated = false; // Whether the client is logged in or registered 
+    std::string currentUser;      // Current user's username
 
     while (true) {
+        // Receive a Packet using the wire protocol
         auto pkt = receivePacket(sockFd);
         if (!pkt) {
             std::cout << "[INFO] Client disconnected or error.\n";
             break;
         }
 
-        char op = pkt->getOpCode();
+        char op = pkt->op_code; // e.g. 'L' for login, 'R' for register
+
         if (!isAuthenticated) {
-            // Not authenticated => only allow 'L' or 'R'
+            // Not authenticated => we only allow 'L' or 'R'
             if (op == 'L' || op == 'R') {
-                std::string uname = pkt->getUsername(); 
-                std::string pwd   = pkt->getPassword();
+                std::string uname = pkt->username; 
+                std::string pwd   = pkt->password;
                 if (!uname.empty() && !pwd.empty()) {
-                    bool ok = false;
+                    bool validated = false;
                     if (op == 'L') {
                         // Attempt login
-                        ok = userLogin(sockFd, uname, pwd, op);
+                        validated = userLogin(sockFd, uname, pwd, op);
                     } else {
                         // Attempt register
-                        ok = userRegister(sockFd, uname, pwd, op);
+                        validated = userRegister(sockFd, uname, pwd, op);
                     }
-                    if (ok) {
+                    if (validated) {
                         // success => mark isAuthenticated
                         isAuthenticated = true;
-                        currentUser = uname; 
+                        currentUser = uname;
                         std::cout << "[INFO] " << currentUser << " is now authenticated.\n";
                     } else {
-                        // user disconnected or gave up
+                        // userLogin/userRegister loops until success or client disconnect
+                        // so we should break if they fail
                         break;
                     }
                 } else {
-                    // missing username/pass? Could send an error or ignore
+                    // missing username/pass => send negative validation
                     std::cerr << "[WARN] handleClient: empty username/pass.\n";
+
+                    Packet v;
+                    v.op_code     = 'v';   // validation
+                    v.isValidated = false;
+                    sendPacket(sockFd, v);
+                    // continue to next iteration, letting the user try again
+                    continue;
                 }
             } else {
-                // Not authenticated => ignore other ops
-                std::cout << "[WARN] Received op_code '" << op 
-                          << "' but not authenticated.\n";
+                // This line should not be reached as client usually sends 'L' or 'R' first
+                continue;
             }
         } else {
-            // Already authenticated
+            // Already authenticated. We expect other operations: 's', 'l', 'd', 'q', ...
             if (op == 's') {
-                // "send"
-                std::string sender    = pkt->getSender();
-                std::string recipient = pkt->getRecipient();
-                std::string message   = pkt->getMessage();
-                std::cout << "[INFO] SendPacket from " << sender
+                // "send" => packet has .sender, .recipient, .message
+                std::string sender    = pkt->sender;
+                std::string recipient = pkt->recipient;
+                std::string message   = pkt->message;
+                std::cout << "[INFO] Packet(op_code='s') from " << sender
                           << " to " << recipient << ": " << message << "\n";
 
                 // Possibly store or forward this message
@@ -284,23 +298,33 @@ void handleClient(int sockFd) {
                     if (it == userMap.end()) {
                         // recipient does not exist or was never registered
                         std::cerr << "[WARN] recipient '" << recipient << "' not found.\n";
-                        // We could notify the sender or store anyway
+                        
+                        // We can send a Packet back to sender indicating error
+                        Packet invalid;
+                        invalid.op_code  = 's';       // or 'm' for custom
+                        invalid.sender   = "Server";
+                        invalid.recipient = sender;
+                        invalid.message  = "Invalid recipient";
+                        sendPacket(sockFd, invalid);
+
                     } else {
                         if (it->second.isOnline) {
                             // Forward the message immediately
                             int recSock = it->second.socketFd;
-                            // Construct a SendPacket to deliver to recipient
-                            SendPacket forwardPkt;
+
+                            Packet forwardPkt;
+                            forwardPkt.op_code   = 's';
                             forwardPkt.sender    = sender;
                             forwardPkt.recipient = recipient;
                             forwardPkt.message   = message;
                             sendPacket(recSock, forwardPkt);
+
                         } else {
                             // Add to offline messages
                             Message offMsg;
-                            offMsg.sender = sender;
+                            offMsg.sender    = sender;
                             offMsg.recipient = recipient;
-                            offMsg.content = message;
+                            offMsg.content   = message;
                             it->second.offlineMessages.push_back(offMsg);
                             std::cout << "[INFO] Stored message for offline user '" 
                                       << recipient << "'.\n";
@@ -310,8 +334,8 @@ void handleClient(int sockFd) {
 
             } else if (op == 'l') {
                 // "list users"
-                std::string requestor = pkt->getSender();
-                std::cout << "[INFO] ListUsersPacket from " << requestor << "\n";
+                std::string requestor = pkt->sender;
+                std::cout << "[INFO] Packet(op_code='l') from " << requestor << "\n";
                 // Build a list of all usernames
                 std::string allUsers;
                 {
@@ -323,18 +347,19 @@ void handleClient(int sockFd) {
                         allUsers += kv.first;
                     }
                 }
-                // Respond with a "send" style packet
-                SendPacket resp;
+                // Respond with a Packet(op_code='s') or 'm' containing the user list
+                Packet resp;
+                resp.op_code   = 's';     // or 'm', if you prefer
                 resp.sender    = "Server";
                 resp.recipient = requestor;
                 resp.message   = allUsers;
                 sendPacket(sockFd, resp);
 
             } else if (op == 'd') {
-                // "delete" => getSender(), getMessageId()
-                std::string sender = pkt->getSender();
-                std::string msgId  = pkt->getMessageId();
-                std::cout << "[INFO] DeletePacket from " << sender
+                // "delete" => we have .sender and .message_id
+                std::string sender = pkt->sender;
+                std::string msgId  = pkt->message_id;
+                std::cout << "[INFO] Packet(op_code='d') from " << sender
                           << " for message_id=" << msgId << "\n";
                 int msgIDnumeric = std::atoi(msgId.c_str());
                 {
@@ -354,6 +379,7 @@ void handleClient(int sockFd) {
                 break;
             } else {
                 std::cout << "[WARN] Unknown op_code: " << op << "\n";
+                // Optionally send an error packet
             }
         }
     }
@@ -370,21 +396,29 @@ void handleClient(int sockFd) {
     close(sockFd);
 }
 
+
 int main(int argc, char* argv[]) {
-    int port = 54000;
-    if (argc >= 2) {
-        port = std::atoi(argv[1]);
-        if (port <= 0) {
-            std::cerr << "Invalid port. Using default 54000.\n";
-            port = 54000;
-        }
+    int port = 54000;   // Default port: 54000 
+
+    if (argc == 1) {
+        std::string p = std::to_string(port); 
+        std::cout << "Using port " << p << "...\n";
+    } else if (argc == 2) {
+        port = std::atoi(argv[1]); 
+        std::cout << "Using port " << argv[1] << "...\n";
+    } else {
+        std::cerr << "Usage: " << argv[0] << " <port>" << std::endl; 
+        return 1; 
     }
 
+    // Create TCP socket (IPv4)
     int serverSock = socket(AF_INET, SOCK_STREAM, 0);
     if (serverSock < 0) {
         perror("socket failed");
         return EXIT_FAILURE;
     }
+
+    // Set socket as reusable
     int opt = 1;
     if (setsockopt(serverSock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         perror("setsockopt failed");
@@ -392,17 +426,21 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
+    // Define host address
     sockaddr_in serverAddr;
     std::memset(&serverAddr, 0, sizeof(serverAddr));
     serverAddr.sin_family      = AF_INET;
     serverAddr.sin_addr.s_addr = INADDR_ANY;
     serverAddr.sin_port        = htons(port);
 
+    // Bind socket
     if (bind(serverSock, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
         perror("bind failed");
         close(serverSock);
         return EXIT_FAILURE;
     }
+
+    // Listen
     if (listen(serverSock, SOMAXCONN) < 0) {
         perror("listen failed");
         close(serverSock);
@@ -411,7 +449,6 @@ int main(int argc, char* argv[]) {
 
     std::cout << "[INFO] Server listening on port " << port << "...\n";
 
-    // Multithreaded accept loop
     while (true) {
         sockaddr_in clientAddr;
         socklen_t clientLen = sizeof(clientAddr);
