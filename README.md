@@ -2,6 +2,16 @@
 
 ## server.cpp
 
+`g++ -std=c++17 -pthread server.cpp custom_wire_protocol.cpp \
+    -I/opt/homebrew/Cellar/argon2/20190702_1/include \
+    -I/opt/homebrew/opt/openssl@3/include \
+    -L/opt/homebrew/Cellar/argon2/20190702_1/lib \
+    -L/opt/homebrew/opt/openssl@3/lib \
+    -largon2 -lssl -lcrypto \
+    -o server`
+
+
+
 Compile: `g++ -std=c++17 -pthread server.cpp custom_wire_protocol.cpp \
     -I/opt/homebrew/opt/argon2/include \
     -I/opt/homebrew/opt/openssl@3/include \

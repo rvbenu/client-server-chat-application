@@ -1,21 +1,3 @@
-/*
- * server.cpp
- *
- * This server:
- *  - Accepts a port number from the command line (default=54000 if omitted).
- *  - Listens for incoming client connections (plain TCP).
- *  - Spawns a thread for each client.
- *  - Uses Argon2-based password hashing for secure password storage.
- *  - Uses a custom wire protocol with Packet-based key-value pairs (no JSON).
- *
- * Compilation:
- *   g++ -std=c++17 -pthread server.cpp custom_wire_protocol.cpp -largon2 -lssl -lcrypto -o server
- *
- * Usage:
- *   ./server <port>
- *   If <port> is omitted, defaults to 54000.
- */
-
 #include <iostream>
 #include <thread>
 #include <unordered_map>
@@ -32,288 +14,346 @@
 #include <unistd.h>
 #include <netdb.h>
 
-// Argon2 and OpenSSL RAND
-#include <argon2.h>
-#include <openssl/rand.h>
-
-// Our wire protocol interface (Packet struct, sendPacket, receivePacket)
-#include "wire_protocol.h"
-
-// Argon2 parameters
-static const uint32_t T_COST = 2;          // number of iterations
-static const uint32_t M_COST = (1 << 16);  // memory usage (64MB)
-static const uint32_t PARALLELISM = 1;
-static const size_t SALT_LEN = 16;
-static const size_t HASH_LEN = 32;
-static const size_t ENCODED_LEN = 128;
+#include "user_auth/user_auth.h"
+#include "wire_protocol/json_wire_protocol.h"
 
 /**
- * @brief A simple user record with Argon2 hashed password, online state, and offline messages.
+ * @brief A message record (indexed by an int ID).
  */
-struct UserInfo {
-    std::string password;                      // Argon2 hashed (encoded) password
-    bool isOnline = false;                     // True if user is connected
-    int socketFd = -1;                         // Socket file descriptor
-    std::vector<std::string> offlineMessages;  // queued messages while offline
+struct Message {
+    std::string content;
+    std::string sender;
+    std::string recipient;
 };
 
-// Global data structures
+/**
+ * @brief A simple user record for demonstration.
+ */
+struct UserInfo {
+    std::string password;   // Argon2 hashed (encoded) password
+    bool isOnline = false;  // True if user is connected
+    int socketFd = -1;      // Socket file descriptor
+
+    // We store queued messages for offline users here
+    std::vector<Message> offlineMessages;
+};
+
+// Global map: message ID -> Message
+static int messageCounter = 0;  // increments forever
+static std::unordered_map<int, Message> messages;
+static std::mutex messagesMutex;
+
+// Global map: username -> UserInfo
 static std::unordered_map<std::string, UserInfo> userMap;
 static std::mutex userMapMutex;
 
-/**
- * @brief Generate an Argon2 hash for a plaintext password.
- * @param password The user's plaintext password
- * @return The Argon2-encoded hash string, or "" on error
- */
-std::string argon2HashPassword(const std::string &password) {
-    // Generate random salt
-    unsigned char salt[SALT_LEN];
-    if (RAND_bytes(salt, SALT_LEN) != 1) {
-        std::cerr << "[ERROR] RAND_bytes failed to generate salt.\n";
-        return "";
-    }
-    char encoded[ENCODED_LEN];
-    int ret = argon2_hash(
-        T_COST, M_COST, PARALLELISM,
-        password.data(), password.size(),
-        salt, SALT_LEN,
-        nullptr, HASH_LEN,
-        encoded, ENCODED_LEN,
-        Argon2_id, ARGON2_VERSION_13
-    );
-    if (ret != ARGON2_OK) {
-        std::cerr << "[ERROR] argon2_hash: " << argon2_error_message(ret) << std::endl;
-        return "";
-    }
-    return std::string(encoded);
-}
+// Forward declarations
+bool userLogin(int sockFd, const std::string &initialUsername,
+               const std::string &initialPassword, char opCode);
+
+bool userRegister(int sockFd, const std::string &initialUsername,
+                  const std::string &initialPassword, char opCode);
 
 /**
- * @brief Verify a plaintext password against an Argon2-encoded hash.
- * @param encodedHash The Argon2 encoded hash stored in userMap
- * @param password The plaintext password
- * @return true if correct, false otherwise
+ * @brief Attempt to log in the user in a loop:
+ *  1) If user exists and password matches, send ValidatePacket(isValidated=true), mark online, return true.
+ *  2) Otherwise, send ValidatePacket(isValidated=false).
+ *     Then expect another packet (could be another LoginPacket, or a RegisterPacket, etc.).
+ *     If 'R', calls userRegister; if 'L', tries login again; if no packet or error, return false.
  */
-bool argon2CheckPassword(const std::string &encodedHash, const std::string &password) {
-    int ret = argon2_verify(encodedHash.c_str(), password.data(), password.size(), Argon2_id);
-    return (ret == ARGON2_OK);
-}
+bool userLogin(int sockFd, const std::string &initialUsername,
+               const std::string &initialPassword, char opCode) 
+{
+    std::string username = initialUsername;
+    std::string password = initialPassword;
 
-/**
- * @brief Deliver offline messages to the user after successful login.
- */
-void deliverOfflineMessages(const std::string &username, int sockFd) {
-    std::vector<std::string> messages;
-    {
-        std::lock_guard<std::mutex> lock(userMapMutex);
-        auto it = userMap.find(username);
-        if (it == userMap.end()) return;
-        messages = std::move(it->second.offlineMessages);
-        it->second.offlineMessages.clear();
-    }
-    for (auto &msg : messages) {
-        Packet pkt;
-        pkt.fields["op"]      = "RECEIVE_MSG_OFFLINE";
-        pkt.fields["content"] = msg;
-        sendPacket(sockFd, pkt);
-    }
-}
-
-/**
- * @brief Check if a username exists and respond with "CHECK_USER_RES" = { "exists":"true"/"false" }.
- */
-bool checkIfUserExists(int sockFd, const std::string &username) {
-    bool exists = false;
-    {
-        std::lock_guard<std::mutex> lock(userMapMutex);
-        exists = (userMap.find(username) != userMap.end());
-    }
-    Packet resp;
-    resp.fields["op"]     = "CHECK_USER_RES";
-    resp.fields["exists"] = exists ? "true" : "false";
-    return sendPacket(sockFd, resp);
-}
-
-/**
- * @brief Registration => hash password with Argon2, store encoded
- *        Login => verify Argon2
- */
-bool loginOrRegister(int sockFd, const std::string &username, const std::string &password, const std::string &op) {
-    bool success = false;
-    std::string status = "FAIL";
-
-    {
-        std::lock_guard<std::mutex> lock(userMapMutex);
-        if (op == "LOGIN") {
-            // login => check Argon2
+    while (true) {
+        bool success = false;
+        {
+            std::lock_guard<std::mutex> lock(userMapMutex);
             auto it = userMap.find(username);
             if (it != userMap.end()) {
+                // Check password
                 if (argon2CheckPassword(it->second.password, password)) {
+                    // Mark user online
                     it->second.isOnline = true;
                     it->second.socketFd = sockFd;
                     success = true;
-                    status = "SUCCESS";
                 }
             }
-        } else if (op == "REGISTER") {
-            // register => hash Argon2
+        }
+
+        // Send ValidatePacket with success/fail
+        ValidatePacket v;
+        v.isValidated = success;
+        sendPacket(sockFd, v);
+
+        if (success) {
+            std::cout << "[INFO] User '" << username << "' logged in.\n";
+
+            // Show & deliver offline messages
+            {
+                std::lock_guard<std::mutex> lock(userMapMutex);
+                auto &info = userMap[username];
+                int offlineCount = (int)info.offlineMessages.size();
+                if (offlineCount > 0) {
+                    std::cout << "[INFO] " << username << " has " 
+                              << offlineCount << " offline messages.\n";
+
+                    // Wait 2 seconds
+                    // std::this_thread::sleep_for(std::chrono::seconds(2));
+
+                    // Deliver each offline message as a SendPacket
+                    for (const auto &offMsg : info.offlineMessages) {
+                        SendPacket forwardPkt;
+                        forwardPkt.sender    = offMsg.sender;
+                        forwardPkt.recipient = offMsg.recipient;
+                        forwardPkt.message   = offMsg.content;
+
+                        // Send to the newly logged-in user
+                        sendPacket(sockFd, forwardPkt);
+                    }
+
+                    // Clear them so they are not re-sent next time
+                    info.offlineMessages.clear();
+                }
+            }
+
+            return true; 
+        }
+
+        // Not successful => expect next packet
+        auto nextPkt = receivePacket(sockFd);
+        if (!nextPkt) {
+            std::cerr << "[WARN] userLogin: client disconnected.\n";
+            return false; 
+        }
+        char nextOp = nextPkt->getOpCode();
+        if (nextOp == 'L') {
+            // Another login attempt
+            username = nextPkt->getUsername();
+            password = nextPkt->getPassword();
+        } else if (nextOp == 'R') {
+            // Switch to register
+            std::string uname = nextPkt->getUsername();
+            std::string pwd   = nextPkt->getPassword();
+            if (userRegister(sockFd, uname, pwd, nextOp)) {
+                return true;
+            } else {
+                return false;
+            }
+        } else {
+            std::cerr << "[WARN] userLogin: unexpected op_code=" << nextOp << "\n";
+            return false;
+        }
+    }
+}
+
+
+
+
+/**
+ * @brief Attempt to register the user in a loop:
+ *  1) If username is available, store user in userMap, send ValidatePacket(isValidated=true), and return true.
+ *  2) Otherwise, send ValidatePacket(isValidated=false).
+ *     Then expect next packet. Could be another RegisterPacket or a LoginPacket, etc.
+ */
+bool userRegister(int sockFd, const std::string &initialUsername,
+                  const std::string &initialPassword, char opCode)
+{
+    std::string username = initialUsername;
+    std::string password = initialPassword;
+
+    while (true) {
+        bool success = false;
+        {
+            std::lock_guard<std::mutex> lock(userMapMutex);
             auto it = userMap.find(username);
             if (it == userMap.end()) {
-                std::string encoded = argon2HashPassword(password);
-                if (!encoded.empty()) {
-                    UserInfo newUser;
-                    newUser.password = encoded;
-                    newUser.isOnline = true;
-                    newUser.socketFd = sockFd;
-                    userMap[username] = std::move(newUser);
-                    success = true;
-                    status = "SUCCESS";
-                }
+                // Not found => can register
+                UserInfo newUser;
+                newUser.password = argon2HashPassword(password); 
+                newUser.isOnline = true;
+                newUser.socketFd = sockFd;
+                userMap[username] = std::move(newUser);
+                success = true;
             }
         }
-    }
 
-    // respond
-    Packet resp;
-    resp.fields["op"]     = (op == "LOGIN") ? "LOGIN_RES" : "REGISTER_RES";
-    resp.fields["status"] = status;
-    sendPacket(sockFd, resp);
+        ValidatePacket v;
+        v.isValidated = success;
+        sendPacket(sockFd, v);
 
-    // If success and op=LOGIN => deliver offline
-    if (success && op == "LOGIN") {
-        deliverOfflineMessages(username, sockFd);
-    }
-    return success;
-}
+        if (success) {
+            std::cout << "[INFO] User '" << username << "' registered.\n";
+            return true;
+        }
 
-/**
- * @brief Lists all users or those matching a searchTerm, sends result in a Packet.
- */
-bool listUsers(int sockFd, const std::string &searchTerm) {
-    std::vector<std::string> matches;
-    {
-        std::lock_guard<std::mutex> lock(userMapMutex);
-        for (auto &kv : userMap) {
-            const std::string &uname = kv.first;
-            if (searchTerm.empty() || uname.find(searchTerm) != std::string::npos) {
-                matches.push_back(uname);
+        // user already taken => expect next packet
+        auto nextPkt = receivePacket(sockFd);
+        if (!nextPkt) {
+            std::cerr << "[WARN] userRegister: client disconnected.\n";
+            return false;
+        }
+        char nextOp = nextPkt->getOpCode();
+        if (nextOp == 'R') {
+            username = nextPkt->getUsername();
+            password = nextPkt->getPassword();
+        } else if (nextOp == 'L') {
+            std::string uname = nextPkt->getUsername();
+            std::string pwd   = nextPkt->getPassword();
+            if (userLogin(sockFd, uname, pwd, nextOp)) {
+                return true;
+            } else {
+                return false;
             }
+        } else {
+            std::cerr << "[WARN] userRegister: unexpected op_code=" << nextOp << "\n";
+            return false;
         }
     }
-    // Build comma-separated or store them in a single field
-    std::string userList;
-    for (size_t i = 0; i < matches.size(); i++) {
-        userList += matches[i];
-        if (i + 1 < matches.size()) userList += ",";
-    }
-    Packet pkt;
-    pkt.fields["op"]    = "LIST_USERS_RES";
-    pkt.fields["users"] = userList;
-    return sendPacket(sockFd, pkt);
 }
 
 /**
- * @brief Send message from sender to recipient. If offline, queue it. If online, send a "RECEIVE_MSG".
- */
-bool sendUserMessage(const std::string &sender, const std::string &recipient, const std::string &content) {
-    std::string msg = "[FROM " + sender + "]: " + content;
-    std::lock_guard<std::mutex> lock(userMapMutex);
-    auto it = userMap.find(recipient);
-    if (it == userMap.end()) {
-        return false;
-    }
-    if (it->second.isOnline) {
-        Packet pkt;
-        pkt.fields["op"]      = "RECEIVE_MSG";
-        pkt.fields["from"]    = sender;
-        pkt.fields["content"] = content;
-        sendPacket(it->second.socketFd, pkt);
-    } else {
-        it->second.offlineMessages.push_back(msg);
-    }
-    return true;
-}
-
-/**
- * @brief Delete messages (placeholder).
- */
-bool deleteMessages(int sockFd, const std::string &username, const std::string &ids) {
-    Packet pkt;
-    pkt.fields["op"]     = "DELETE_MSG_RES";
-    pkt.fields["status"] = "SUCCESS";
-    pkt.fields["ids"]    = ids;
-    return sendPacket(sockFd, pkt);
-}
-
-/**
- * @brief The main per-client thread. Receives Packets, handles ops.
+ * @brief Main per-client loop.
  */
 void handleClient(int sockFd) {
     bool isAuthenticated = false;
     std::string currentUser;
 
     while (true) {
-        Packet pkt = receivePacket(sockFd);
-        if (pkt.fields.empty()) {
+        auto pkt = receivePacket(sockFd);
+        if (!pkt) {
             std::cout << "[INFO] Client disconnected or error.\n";
             break;
         }
-        auto it = pkt.fields.find("op");
-        if (it == pkt.fields.end()) {
-            std::cerr << "[ERROR] Packet missing 'op'.\n";
-            continue;
-        }
-        const std::string &op = it->second;
 
-        if (op == "QUIT") {
-            std::cout << "[INFO] Client requested QUIT.\n";
-            break;
-        } else if (!isAuthenticated) {
-            if (op == "CHECK_USER") {
-                // e.g. { "op":"CHECK_USER", "username":"bob" }
-                auto unameIt = pkt.fields.find("username");
-                if (unameIt != pkt.fields.end()) {
-                    checkIfUserExists(sockFd, unameIt->second);
-                }
-            } else if (op == "LOGIN" || op == "REGISTER") {
-                std::string uname = pkt.fields.count("username") ? pkt.fields.at("username") : "";
-                std::string pwd   = pkt.fields.count("password") ? pkt.fields.at("password") : "";
+        char op = pkt->getOpCode();
+        if (!isAuthenticated) {
+            // Not authenticated => only allow 'L' or 'R'
+            if (op == 'L' || op == 'R') {
+                std::string uname = pkt->getUsername(); 
+                std::string pwd   = pkt->getPassword();
                 if (!uname.empty() && !pwd.empty()) {
-                    if (loginOrRegister(sockFd, uname, pwd, op)) {
-                        isAuthenticated = true;
-                        currentUser = uname;
+                    bool ok = false;
+                    if (op == 'L') {
+                        // Attempt login
+                        ok = userLogin(sockFd, uname, pwd, op);
+                    } else {
+                        // Attempt register
+                        ok = userRegister(sockFd, uname, pwd, op);
                     }
+                    if (ok) {
+                        // success => mark isAuthenticated
+                        isAuthenticated = true;
+                        currentUser = uname; 
+                        std::cout << "[INFO] " << currentUser << " is now authenticated.\n";
+                    } else {
+                        // user disconnected or gave up
+                        break;
+                    }
+                } else {
+                    // missing username/pass? Could send an error or ignore
+                    std::cerr << "[WARN] handleClient: empty username/pass.\n";
                 }
             } else {
-                Packet err;
-                err.fields["op"]      = "ERROR";
-                err.fields["message"] = "Not authenticated";
-                sendPacket(sockFd, err);
+                // Not authenticated => ignore other ops
+                std::cout << "[WARN] Received op_code '" << op 
+                          << "' but not authenticated.\n";
             }
         } else {
-            // authenticated
-            if (op == "LIST_USERS") {
-                std::string st = pkt.fields.count("search") ? pkt.fields.at("search") : "";
-                listUsers(sockFd, st);
-            } else if (op == "SEND_MSG") {
-                std::string rec = pkt.fields.count("recipient") ? pkt.fields.at("recipient") : "";
-                std::string ctt = pkt.fields.count("content")   ? pkt.fields.at("content")   : "";
-                if (!rec.empty() && !ctt.empty()) {
-                    sendUserMessage(currentUser, rec, ctt);
-                    Packet ack;
-                    ack.fields["op"]     = "SEND_MSG_RES";
-                    ack.fields["status"] = "SUCCESS";
-                    sendPacket(sockFd, ack);
+            // Already authenticated
+            if (op == 's') {
+                // "send"
+                std::string sender    = pkt->getSender();
+                std::string recipient = pkt->getRecipient();
+                std::string message   = pkt->getMessage();
+                std::cout << "[INFO] SendPacket from " << sender
+                          << " to " << recipient << ": " << message << "\n";
+
+                // Possibly store or forward this message
+                {
+                    std::lock_guard<std::mutex> lock1(userMapMutex);
+                    std::lock_guard<std::mutex> lock2(messagesMutex);
+
+                    messageCounter++;
+                    messages[messageCounter] = {message, sender, recipient};
+
+                    // Check if recipient is online
+                    auto it = userMap.find(recipient);
+                    if (it == userMap.end()) {
+                        // recipient does not exist or was never registered
+                        std::cerr << "[WARN] recipient '" << recipient << "' not found.\n";
+                        // We could notify the sender or store anyway
+                    } else {
+                        if (it->second.isOnline) {
+                            // Forward the message immediately
+                            int recSock = it->second.socketFd;
+                            // Construct a SendPacket to deliver to recipient
+                            SendPacket forwardPkt;
+                            forwardPkt.sender    = sender;
+                            forwardPkt.recipient = recipient;
+                            forwardPkt.message   = message;
+                            sendPacket(recSock, forwardPkt);
+                        } else {
+                            // Add to offline messages
+                            Message offMsg;
+                            offMsg.sender = sender;
+                            offMsg.recipient = recipient;
+                            offMsg.content = message;
+                            it->second.offlineMessages.push_back(offMsg);
+                            std::cout << "[INFO] Stored message for offline user '" 
+                                      << recipient << "'.\n";
+                        }
+                    }
                 }
-            } else if (op == "DELETE_MSG") {
-                std::string ids = pkt.fields.count("ids") ? pkt.fields.at("ids") : "";
-                deleteMessages(sockFd, currentUser, ids);
+
+            } else if (op == 'l') {
+                // "list users"
+                std::string requestor = pkt->getSender();
+                std::cout << "[INFO] ListUsersPacket from " << requestor << "\n";
+                // Build a list of all usernames
+                std::string allUsers;
+                {
+                    std::lock_guard<std::mutex> lock(userMapMutex);
+                    for (const auto& kv : userMap) {
+                        if (!allUsers.empty()) {
+                            allUsers += ", ";
+                        }
+                        allUsers += kv.first;
+                    }
+                }
+                // Respond with a "send" style packet
+                SendPacket resp;
+                resp.sender    = "Server";
+                resp.recipient = requestor;
+                resp.message   = allUsers;
+                sendPacket(sockFd, resp);
+
+            } else if (op == 'd') {
+                // "delete" => getSender(), getMessageId()
+                std::string sender = pkt->getSender();
+                std::string msgId  = pkt->getMessageId();
+                std::cout << "[INFO] DeletePacket from " << sender
+                          << " for message_id=" << msgId << "\n";
+                int msgIDnumeric = std::atoi(msgId.c_str());
+                {
+                    std::lock_guard<std::mutex> lock(messagesMutex);
+                    auto it = messages.find(msgIDnumeric);
+                    if (it != messages.end() && it->second.sender == sender) {
+                        messages.erase(it);
+                        std::cout << "[INFO] Deleted message " << msgIDnumeric << "\n";
+                    } else {
+                        std::cout << "[WARN] Cannot delete message " << msgIDnumeric << "\n";
+                    }
+                }
+
+            } else if (op == 'q') {
+                // "quit"
+                std::cout << "[INFO] Received quit from " << currentUser << "\n";
+                break;
             } else {
-                Packet err;
-                err.fields["op"]      = "ERROR";
-                err.fields["message"] = "Unknown operation: " + op;
-                sendPacket(sockFd, err);
+                std::cout << "[WARN] Unknown op_code: " << op << "\n";
             }
         }
     }
@@ -330,17 +370,7 @@ void handleClient(int sockFd) {
     close(sockFd);
 }
 
-/**
- * @brief main
- *  1) Creates a TCP socket
- *  2) Binds to the desired port
- *  3) Listens for incoming connections
- *  4) For each connection, spawns handleClient in a thread
- */
 int main(int argc, char* argv[]) {
-    // Optionally, initialize OpenSSL for RAND_bytes
-    // e.g. ERR_load_crypto_strings(); or OpenSSL_add_all_algorithms(); if needed
-
     int port = 54000;
     if (argc >= 2) {
         port = std::atoi(argv[1]);
@@ -363,7 +393,7 @@ int main(int argc, char* argv[]) {
     }
 
     sockaddr_in serverAddr;
-    memset(&serverAddr, 0, sizeof(serverAddr));
+    std::memset(&serverAddr, 0, sizeof(serverAddr));
     serverAddr.sin_family      = AF_INET;
     serverAddr.sin_addr.s_addr = INADDR_ANY;
     serverAddr.sin_port        = htons(port);
@@ -381,6 +411,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << "[INFO] Server listening on port " << port << "...\n";
 
+    // Multithreaded accept loop
     while (true) {
         sockaddr_in clientAddr;
         socklen_t clientLen = sizeof(clientAddr);
@@ -391,8 +422,10 @@ int main(int argc, char* argv[]) {
         }
         char ipBuf[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &(clientAddr.sin_addr), ipBuf, sizeof(ipBuf));
-        std::cout << "[INFO] New client from " << ipBuf << ":" << ntohs(clientAddr.sin_port) << "\n";
-
+        std::cout << "[INFO] New client from " << ipBuf 
+                  << ":" << ntohs(clientAddr.sin_port) << "\n";
+        
+        // Handle this client in a separate thread
         std::thread t(handleClient, clientSock);
         t.detach();
     }
