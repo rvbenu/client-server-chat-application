@@ -18,7 +18,8 @@ This project implements a secure chat application using SSL and a custom JSON wi
   - Uses global containers (protected by mutexes) to maintain user information and message history.
 
   - To use it, install openssl@3 running the following on your terminal: `brew install openssl@3`. We'll also need to install argon2 (for password hashing) also using homebrew: `brew install argon2`.
-  - Compile: ```bash
+  - Compile: 
+  ```bash
   g++ -std=c++17 -pthread server.cpp wire_protocol/json_wire_protocol.cpp wire_protocol/packet.cpp user_auth/user_auth.cpp \
     -I<path to>argon2/include \
     -I<path to>openssl@3/include \
@@ -26,7 +27,8 @@ This project implements a secure chat application using SSL and a custom JSON wi
     -L<path to>openssl@3/lib \
     -largon2 -lssl -lcrypto \
     -o server`
-    On MACX, the compile command is usually: ```bash
+    On MACX, the compile command is usually: 
+    ```bash
     g++ -std=c++17 -pthread server.cpp wire_protocol/json_wire_protocol.cpp wire_protocol/packet.cpp user_auth/user_auth.cpp \
     -I/opt/homebrew/opt/argon2/include \
     -I/opt/homebrew/opt/openssl@3/include \
@@ -44,7 +46,8 @@ This project implements a secure chat application using SSL and a custom JSON wi
   - Runs a background listener thread to process incoming packets from the server and update the GUI accordingly.
 
   - To use it, install openssl@3 running the following on your terminal: `brew install openssl@3`. We'll also need to install argon2 (for password hashing) also using homebrew: `brew install argon2`. Moreover, you'll need to install Tkinter to run the GUI. You do it by using the Python package manager: `pip install tk`. 
-  - Compile: ```bash
+  - Compile: 
+  ```bash
   g++ -std=c++17 -pthread client.cpp wire_protocol/json_wire_protocol.cpp wire_protocol/packet.cpp \
     -I<path to>argon2/include \
     -I<path to>openssl@3/include \
@@ -52,7 +55,8 @@ This project implements a secure chat application using SSL and a custom JSON wi
     -L<path to>openssl@3/lib \
     -largon2 -lssl -lcrypto \
     -o client` 
-    On MACX, the compile command is usually: ```bash
+    On MACX, the compile command is usually: 
+    ```bash
     g++ -std=c++17 -pthread client.cpp wire_protocol/json_wire_protocol.cpp wire_protocol/packet.cpp \
     -I/opt/homebrew/opt/argon2/include \
     -I/opt/homebrew/opt/openssl@3/include \
