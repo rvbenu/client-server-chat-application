@@ -1,149 +1,184 @@
-#include <iostream>
-#include <thread>
-#include <unordered_map>
-#include <vector>
-#include <mutex>
-#include <string>
-#include <cstring>
-#include <cerrno>
-#include <cstdlib>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+#include <iostream>         
+#include <thread>          
+#include <unordered_map> 
+#include <vector>      
+#include <mutex>    
+#include <string>          
+#include <cstring>       
+#include <cerrno>        
+#include <cstdlib>     
+#include <algorithm>    
+#include <netinet/in.h>  
+#include <arpa/inet.h> 
 #include <unistd.h>
-#include <netdb.h>
+#include <netdb.h> 
+#include <sys/types.h>  
 
-// User authentication (argon2CheckPassword, argon2HashPassword, etc.)
+// OpenSSL headers for SSL/TLS support
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
+// Include user authentication functions, e.g. argon2CheckPassword, argon2HashPassword, etc.
 #include "user_auth/user_auth.h"
 
-// The new unified Packet class and JSON wire protocol
-#include "wire_protocol/json_wire_protocol.h"
+// Include our JSON wire protocol functions for sending/receiving packets.
+#include "wire_protocol/json_wire_protocol.h"           // (UN)COMMENT TO CHANGE PROTOCOLS.
+// #include "wire_protocol/custom_wire_protocol.h"      // (UN)COMMENT TO CHANGE PROTOCOLS.
+
+// Include packet definitions used for our custom protocol.
+#include "wire_protocol/packet.h"
+
+// ============================================================================
+// Data structure definitions
+// ============================================================================
 
 /**
- * @brief A message record (indexed by an int ID).
+ * @brief Structure representing a message exchanged between users.
  */
 struct Message {
-    std::string content;
-    std::string sender;
-    std::string recipient;
+    std::string id;         // Unique message identifier as string
+    std::string content;    // The actual message content
+    std::string sender;     // Sender's username
+    std::string recipient;  // Recipient's username
 };
 
 /**
- * @brief A simple user record for demonstration.
+ * @brief Structure representing user information.
+ * 
+ * Contains the hashed password, online status, SSL connection pointer,
+ * and any offline messages queued for the user.
  */
 struct UserInfo {
-    std::string password;   // Argon2 hashed (encoded) password
-    bool isOnline = false;  // True if user is connected
-    int socketFd = -1;      // Socket file descriptor
-
-    // We store queued messages for offline users here
-    std::vector<Message> offlineMessages;
+    std::string password;      // Hashed password (using argon2)
+    bool isOnline = false;     // Online status flag (false by default)
+    int socketFd = -1;         // File descriptor for the user's socket
+    SSL* ssl = nullptr;        // Pointer to the user's SSL connection
+    std::vector<Message> offlineMessages;  // Offline messages waiting for the user
 };
 
-// Global map: message ID -> Message
-static int messageCounter = 0;  // increments forever
+// ============================================================================
+// Global variables
+// ============================================================================
+
+// Global message counter for assigning unique IDs to messages.
+static int messageCounter = 0;
+
+// Global container to store all messages, mapped by a unique integer ID.
 static std::unordered_map<int, Message> messages;
+
+// Mutex to protect access to the messages map in multi-threaded environment.
 static std::mutex messagesMutex;
 
-// Global map: username -> UserInfo
+// Global container to store user information, mapped by username.
 static std::unordered_map<std::string, UserInfo> userMap;
+
+// Mutex to protect access to the userMap.
 static std::mutex userMapMutex;
 
-// Forward declarations
-bool userLogin(int sockFd, const std::string &initialUsername,
-               const std::string &initialPassword, char opCode);
+// Forward declarations of user registration and login functions.
+bool userRegister(SSL* ssl, const std::string &initialUsername, const std::string &initialPassword);
+bool userLogin(SSL* ssl, const std::string &initialUsername, const std::string &initialPassword);
 
-bool userRegister(int sockFd, const std::string &initialUsername,
-                  const std::string &initialPassword, char opCode);
+// ============================================================================
+// SSL Context Initialization
+// ============================================================================
 
 /**
- * @brief Attempt to log in the user in a loop:
- *  1) If user exists and password matches, send Packet(op_code='v', isValidated=true), mark online, return true.
- *  2) Otherwise, send Packet(op_code='v', isValidated=false).
- *     Then expect another packet (could be another Packet with op_code='L' or 'R').
- *     If 'R', calls userRegister; if 'L', tries login again; if no packet or error, return false.
+ * @brief Initializes the OpenSSL context and loads the server's certificate and private key.
+ * 
+ * @return SSL_CTX* A pointer to the initialized SSL context.
  */
-bool userLogin(int sockFd, const std::string &initialUsername,
-               const std::string &initialPassword, char opCode) 
-{
+SSL_CTX* initializeSSLContext() {
+    // Initialize OpenSSL library
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
+
+    // Create a new SSL context using the TLS server method
+    const SSL_METHOD* method = TLS_server_method();
+    SSL_CTX* ctx = SSL_CTX_new(method);
+    if (!ctx) {
+        // If context creation fails, print errors and exit.
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+    // Load the server's certificate from file (PEM format)
+    if (SSL_CTX_use_certificate_file(ctx, "server.crt", SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+    // Load the server's private key from file (PEM format)
+    if (SSL_CTX_use_PrivateKey_file(ctx, "server.key", SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+    return ctx;
+}
+
+// ============================================================================
+// User Login Function (SSL version)
+// ============================================================================
+
+/**
+ * @brief Handles user login over an SSL connection.
+ * 
+ * Repeatedly receives login attempts until a valid login is achieved or the client disconnects.
+ * Also supports switching to user registration if requested.
+ * 
+ * @param ssl Pointer to the SSL connection.
+ * @param initialUsername The initial username provided by the client.
+ * @param initialPassword The initial password provided by the client.
+ * @return true if login is successful; false otherwise.
+ */
+bool userLogin(SSL* ssl, const std::string &initialUsername, const std::string &initialPassword) {
+    // Copy initial username and password for local processing.
     std::string username = initialUsername;
     std::string password = initialPassword;
-
     while (true) {
         bool success = false;
         {
+            // Lock userMap while checking and updating user status.
             std::lock_guard<std::mutex> lock(userMapMutex);
             auto it = userMap.find(username);
-            if (it != userMap.end()) {
-                // Check password
-                if (argon2CheckPassword(it->second.password, password)) {
-                    // Mark user online
-                    it->second.isOnline = true;
-                    it->second.socketFd = sockFd;
-                    success = true;
-                }
+            // If user exists and password is verified using Argon2, mark as online.
+            if (it != userMap.end() && argon2CheckPassword(it->second.password, password)) {
+                it->second.isOnline = true;
+                it->second.ssl = ssl;
+                success = true;
             }
         }
-
-        // Send Packet with op_code='v' to indicate validation result
+        // Prepare a validation packet to send back to the client.
         Packet v;
-        v.op_code = 'v';        // validate op code
+        v.op_code = 'v';
         v.isValidated = success;
-        sendPacket(sockFd, v);
-
+        if (sendPacketSSL(ssl, v) != SUCCESS) {
+            std::cerr << "[ERROR] Failed to send validation packet.\n";
+            return false;
+        }
+        // If login is successful, log and return.
         if (success) {
             std::cout << "[INFO] User '" << username << "' logged in.\n";
-
-            // Show & deliver offline messages
-            {
-                std::lock_guard<std::mutex> lock(userMapMutex);
-                auto &info = userMap[username];
-                int offlineCount = (int)info.offlineMessages.size();
-                if (offlineCount > 0) {
-                    std::cout << "[INFO] " << username << " has " 
-                              << offlineCount << " offline messages.\n";
-
-                    // Deliver each offline message as a Packet with op_code='s'
-                    for (const auto &offMsg : info.offlineMessages) {
-                        Packet forwardPkt;
-                        forwardPkt.op_code   = 's';
-                        forwardPkt.sender    = offMsg.sender;
-                        forwardPkt.recipient = offMsg.recipient;
-                        forwardPkt.message   = offMsg.content;
-
-                        // Send to the newly logged-in user
-                        sendPacket(sockFd, forwardPkt);
-                    }
-
-                    // Clear them so they are not re-sent next time
-                    info.offlineMessages.clear();
-                }
-            }
-
-            return true; 
+            return true;
         }
-
-        // Not successful => expect next packet
-        auto nextPkt = receivePacket(sockFd);
+        // Otherwise, wait for next packet for another login or registration attempt.
+        auto nextPkt = receivePacketSSL(ssl);
         if (!nextPkt) {
             std::cerr << "[WARN] userLogin: client disconnected.\n";
-            return false; 
+            return false;
         }
+        // Determine next action based on operation code from client.
         char nextOp = nextPkt->op_code;
         if (nextOp == 'L') {
-            // Another login attempt
+            // New login attempt with updated credentials.
             username = nextPkt->username;
             password = nextPkt->password;
-        } else if (nextOp == 'R') {
-            // Switch to register
-            std::string uname = nextPkt->username;
-            std::string pwd   = nextPkt->password;
-            if (userRegister(sockFd, uname, pwd, nextOp)) {
+        }
+        else if (nextOp == 'R') {
+            // If registration is requested, switch to registration.
+            if (userRegister(ssl, nextPkt->username, nextPkt->password))
                 return true;
-            } else {
+            else
                 return false;
-            }
         } else {
             std::cerr << "[WARN] userLogin: unexpected op_code=" << nextOp << "\n";
             return false;
@@ -151,64 +186,72 @@ bool userLogin(int sockFd, const std::string &initialUsername,
     }
 }
 
+// ============================================================================
+// User Registration Function (SSL version)
+// ============================================================================
 
 /**
- * @brief Attempt to register the user in a loop:
- *  1) If username is available, store user in userMap, send Packet(op_code='v', isValidated=true), and return true.
- *  2) Otherwise, send Packet(op_code='v', isValidated=false).
- *     Then expect next packet. Could be a Packet with op_code='R' or 'L', etc.
+ * @brief Handles new user registration over an SSL connection.
+ * 
+ * Repeatedly receives registration attempts until a new account is successfully created,
+ * or the client switches to login.
+ * 
+ * @param ssl Pointer to the SSL connection.
+ * @param initialUsername The initial username provided by the client.
+ * @param initialPassword The initial password provided by the client.
+ * @return true if registration is successful; false otherwise.
  */
-bool userRegister(int sockFd, const std::string &initialUsername,
-                  const std::string &initialPassword, char opCode)
-{
+bool userRegister(SSL* ssl, const std::string &initialUsername, const std::string &initialPassword) {
+    // Copy initial username and password for local processing.
     std::string username = initialUsername;
     std::string password = initialPassword;
-
     while (true) {
         bool success = false;
         {
+            // Lock the userMap while checking if the username is available.
             std::lock_guard<std::mutex> lock(userMapMutex);
-            auto it = userMap.find(username);
-            if (it == userMap.end()) {
-                // Not found => can register
+            if (userMap.find(username) == userMap.end()) {
+                // Create a new user with a hashed password.
                 UserInfo newUser;
-                newUser.password = argon2HashPassword(password); 
+                newUser.password = argon2HashPassword(password);
                 newUser.isOnline = true;
-                newUser.socketFd = sockFd;
+                newUser.ssl = ssl;
+                // Insert the new user into the global user map.
                 userMap[username] = std::move(newUser);
                 success = true;
             }
         }
-
-        // Send Packet(op_code='v') for validation
+        // Send back a validation packet indicating success or failure.
         Packet v;
-        v.op_code    = 'v';
+        v.op_code = 'v';
         v.isValidated = success;
-        sendPacket(sockFd, v);
-
+        if (sendPacketSSL(ssl, v) != SUCCESS) {
+            std::cerr << "[ERROR] Failed to send validation packet.\n";
+            return false;
+        }
+        // If registration is successful, log and return.
         if (success) {
             std::cout << "[INFO] User '" << username << "' registered.\n";
             return true;
         }
-
-        // user already taken => expect next packet
-        auto nextPkt = receivePacket(sockFd);
+        // Otherwise, wait for next packet to attempt registration or switch to login.
+        auto nextPkt = receivePacketSSL(ssl);
         if (!nextPkt) {
             std::cerr << "[WARN] userRegister: client disconnected.\n";
             return false;
         }
         char nextOp = nextPkt->op_code;
         if (nextOp == 'R') {
+            // New registration attempt with updated credentials.
             username = nextPkt->username;
             password = nextPkt->password;
-        } else if (nextOp == 'L') {
-            std::string uname = nextPkt->username;
-            std::string pwd   = nextPkt->password;
-            if (userLogin(sockFd, uname, pwd, nextOp)) {
+        }
+        else if (nextOp == 'L') {
+            // If login is requested instead, switch to login.
+            if (userLogin(ssl, nextPkt->username, nextPkt->password))
                 return true;
-            } else {
+            else
                 return false;
-            }
         } else {
             std::cerr << "[WARN] userRegister: unexpected op_code=" << nextOp << "\n";
             return false;
@@ -216,209 +259,355 @@ bool userRegister(int sockFd, const std::string &initialUsername,
     }
 }
 
+// ============================================================================
+// Main Client Handler Function (SSL version)
+// ============================================================================
 
 /**
- * @brief This function is called in a thread in main to handle 
- * each client independently. Takes the socket file descriptor 
- * of the connection as an argument. 
+ * @brief Handles communication with a connected client over an SSL connection.
+ * 
+ * This function processes different types of operations (op_codes) sent by the client,
+ * including sending messages, retrieving offline messages, viewing message history,
+ * listing users, deleting messages or accounts, and quitting the connection.
+ * 
+ * @param ssl Pointer to the client's SSL connection.
  */
-void handleClient(int sockFd) {
-    bool isAuthenticated = false; // Whether the client is logged in or registered 
-    std::string currentUser;      // Current user's username
+void handleClient(SSL* ssl) {
+    bool isAuthenticated = false;  // Flag to indicate if the user has been authenticated.
+    std::string currentUser;       // Stores the username of the authenticated user.
 
+    // Main loop for processing client requests.
     while (true) {
-        // Receive a Packet using the wire protocol
-        auto pkt = receivePacket(sockFd);
+        // Receive a packet from the client using SSL.
+        auto pkt = receivePacketSSL(ssl);
         if (!pkt) {
-            std::cout << "[INFO] Client disconnected or error.\n";
+            std::cout << "[INFO] Client disconnected or error occurred.\n";
             break;
         }
+        char op = pkt->op_code;  // Operation code indicating the type of request.
 
-        char op = pkt->op_code; // e.g. 'L' for login, 'R' for register
-
+        // If the client is not authenticated, handle login/registration requests.
         if (!isAuthenticated) {
-            // Not authenticated => we only allow 'L' or 'R'
             if (op == 'L' || op == 'R') {
-                std::string uname = pkt->username; 
-                std::string pwd   = pkt->password;
-                if (!uname.empty() && !pwd.empty()) {
-                    bool validated = false;
-                    if (op == 'L') {
-                        // Attempt login
-                        validated = userLogin(sockFd, uname, pwd, op);
-                    } else {
-                        // Attempt register
-                        validated = userRegister(sockFd, uname, pwd, op);
-                    }
+                // Validate that username and password are not empty.
+                if (!pkt->username.empty() && !pkt->password.empty()) {
+                    // Depending on op_code, call the appropriate authentication function.
+                    bool validated = (op == 'L') ?
+                        userLogin(ssl, pkt->username, pkt->password) :
+                        userRegister(ssl, pkt->username, pkt->password);
                     if (validated) {
-                        // success => mark isAuthenticated
                         isAuthenticated = true;
-                        currentUser = uname;
+                        currentUser = pkt->username;
                         std::cout << "[INFO] " << currentUser << " is now authenticated.\n";
                     } else {
-                        // userLogin/userRegister loops until success or client disconnect
-                        // so we should break if they fail
+                        // If authentication fails, exit the loop.
                         break;
                     }
                 } else {
-                    // missing username/pass => send negative validation
-                    std::cerr << "[WARN] handleClient: empty username/pass.\n";
-
+                    // Warn if username or password is empty.
+                    std::cerr << "[WARN] handleClient: empty username/password.\n";
                     Packet v;
-                    v.op_code     = 'v';   // validation
+                    v.op_code = 'v';
                     v.isValidated = false;
-                    sendPacket(sockFd, v);
-                    // continue to next iteration, letting the user try again
+                    sendPacketSSL(ssl, v);
                     continue;
                 }
             } else {
-                // This line should not be reached as client usually sends 'L' or 'R' first
+                // Ignore any operations until the client authenticates.
                 continue;
             }
         } else {
-            // Already authenticated. We expect other operations: 's', 'l', 'd', 'q', ...
+            // The user is authenticated; process other operations.
             if (op == 's') {
-                // "send" => packet has .sender, .recipient, .message
-                std::string sender    = pkt->sender;
-                std::string recipient = pkt->recipient;
-                std::string message   = pkt->message;
-                std::cout << "[INFO] Packet(op_code='s') from " << sender
-                          << " to " << recipient << ": " << message << "\n";
-
-                // Possibly store or forward this message
-                {
-                    std::lock_guard<std::mutex> lock1(userMapMutex);
-                    std::lock_guard<std::mutex> lock2(messagesMutex);
-
-                    messageCounter++;
-                    messages[messageCounter] = {message, sender, recipient};
-
-                    // Check if recipient is online
-                    auto it = userMap.find(recipient);
-                    if (it == userMap.end()) {
-                        // recipient does not exist or was never registered
-                        std::cerr << "[WARN] recipient '" << recipient << "' not found.\n";
-                        
-                        // We can send a Packet back to sender indicating error
-                        Packet invalid;
-                        invalid.op_code  = 's';       // or 'm' for custom
-                        invalid.sender   = "Server";
-                        invalid.recipient = sender;
-                        invalid.message  = "Invalid recipient";
-                        sendPacket(sockFd, invalid);
-
-                    } else {
-                        if (it->second.isOnline) {
-                            // Forward the message immediately
-                            int recSock = it->second.socketFd;
-
-                            Packet forwardPkt;
-                            forwardPkt.op_code   = 's';
-                            forwardPkt.sender    = sender;
-                            forwardPkt.recipient = recipient;
-                            forwardPkt.message   = message;
-                            sendPacket(recSock, forwardPkt);
-
-                        } else {
-                            // Add to offline messages
-                            Message offMsg;
-                            offMsg.sender    = sender;
-                            offMsg.recipient = recipient;
-                            offMsg.content   = message;
-                            it->second.offlineMessages.push_back(offMsg);
-                            std::cout << "[INFO] Stored message for offline user '" 
-                                      << recipient << "'.\n";
-                        }
-                    }
-                }
-
-            } else if (op == 'l') {
-                // "list users"
-                std::string requestor = pkt->sender;
-                std::cout << "[INFO] Packet(op_code='l') from " << requestor << "\n";
-                // Build a list of all usernames
-                std::string allUsers;
-                {
-                    std::lock_guard<std::mutex> lock(userMapMutex);
-                    for (const auto& kv : userMap) {
-                        if (!allUsers.empty()) {
-                            allUsers += ", ";
-                        }
-                        allUsers += kv.first;
-                    }
-                }
-                // Respond with a Packet(op_code='s') or 'm' containing the user list
-                Packet resp;
-                resp.op_code   = 's';     // or 'm', if you prefer
-                resp.sender    = "Server";
-                resp.recipient = requestor;
-                resp.message   = allUsers;
-                sendPacket(sockFd, resp);
-
-            } else if (op == 'd') {
-                // "delete" => we have .sender and .message_id
+                // 's' operation: Send a message from one user to another.
                 std::string sender = pkt->sender;
-                std::string msgId  = pkt->message_id;
-                std::cout << "[INFO] Packet(op_code='d') from " << sender
-                          << " for message_id=" << msgId << "\n";
-                int msgIDnumeric = std::atoi(msgId.c_str());
+                std::string recipient = pkt->recipient;
+                std::string message = pkt->message;
+                std::cout << "[INFO] Message from " << sender << " to " << recipient
+                          << ": " << message << "\n";
+                std::string message_id;
                 {
+                    // Lock the messages container while updating messageCounter and storing the message.
+                    std::lock_guard<std::mutex> lock(messagesMutex);
+                    messageCounter++;
+                    message_id = std::to_string(messageCounter);
+                    messages[messageCounter] = {message_id, message, sender, recipient};
+                }
+                bool validRecipient = false;
+                {
+                    // Lock the userMap to validate the recipient and process message delivery.
+                    std::lock_guard<std::mutex> lock(userMapMutex);
+                    auto it = userMap.find(recipient);
+                    if (it != userMap.end()) {
+                        validRecipient = true;
+                        // If recipient is online, send the message immediately.
+                        if (it->second.isOnline && it->second.ssl != nullptr) {
+                            Packet forwardPkt;
+                            forwardPkt.op_code = 's';
+                            forwardPkt.sender = sender;
+                            forwardPkt.recipient = recipient;
+                            forwardPkt.message = message;
+                            forwardPkt.message_id = message_id;
+                            sendPacketSSL(it->second.ssl, forwardPkt);
+                        } else {
+                            // Otherwise, store the message as an offline message.
+                            Message offMsg;
+                            offMsg.id = message_id;
+                            offMsg.sender = sender;
+                            offMsg.recipient = recipient;
+                            offMsg.content = message;
+                            it->second.offlineMessages.push_back(offMsg);
+                            std::cout << "[INFO] Stored offline message for '" << recipient << "'.\n";
+                        }
+                    }
+                }
+                // If the recipient is not valid, send an error packet back to the sender.
+                if (!validRecipient) {
+                    Packet errorPkt;
+                    errorPkt.op_code = 's';
+                    errorPkt.sender = "Server";
+                    errorPkt.recipient = sender;
+                    errorPkt.message = "Invalid recipient";
+                    sendPacketSSL(ssl, errorPkt);
+                }
+                // Send a confirmation packet to the sender.
+                Packet confPkt;
+                confPkt.op_code = 'c';
+                confPkt.sender = sender;
+                confPkt.recipient = recipient;
+                confPkt.message = message;
+                confPkt.message_id = message_id;
+                sendPacketSSL(ssl, confPkt);
+            }
+            else if (op == 'r') {
+                // 'r' operation: Retrieve offline messages.
+                std::string user = pkt->sender;
+                int numToRetrieve = std::atoi(pkt->message.c_str());
+                std::vector<Message> messagesToSend;
+                {
+                    // Lock userMap to safely access offline messages for the user.
+                    std::lock_guard<std::mutex> lock(userMapMutex);
+                    auto it = userMap.find(user);
+                    if (it != userMap.end()) {
+                        int count = 0;
+                        // Retrieve up to numToRetrieve offline messages.
+                        for (const auto &msg : it->second.offlineMessages) {
+                            messagesToSend.push_back(msg);
+                            if (++count >= numToRetrieve)
+                                break;
+                        }
+                        // Remove the messages that are about to be sent.
+                        if (count > 0)
+                            it->second.offlineMessages.erase(it->second.offlineMessages.begin(),
+                                                             it->second.offlineMessages.begin() + count);
+                    }
+                }
+                // Send each offline message to the user.
+                for (const auto &msg : messagesToSend) {
+                    Packet forwardPkt;
+                    forwardPkt.op_code = 's';
+                    forwardPkt.message_id = msg.id;
+                    forwardPkt.sender = msg.sender;
+                    forwardPkt.recipient = msg.recipient;
+                    forwardPkt.message = msg.content;
+                    sendPacketSSL(ssl, forwardPkt);
+                }
+            }
+            else if (op == 'h') {
+                // 'h' operation: Retrieve message history (excluding offline messages already delivered).
+                std::string username = pkt->sender;
+                std::vector<std::string> offlineIds;
+                {
+                    // Lock userMap to collect IDs of offline messages.
+                    std::lock_guard<std::mutex> lock(userMapMutex);
+                    auto it = userMap.find(username);
+                    if (it != userMap.end()) {
+                        for (const auto &offMsg : it->second.offlineMessages)
+                            offlineIds.push_back(offMsg.id);
+                    }
+                }
+                std::vector<std::pair<int, Message>> historyMessages;
+                {
+                    // Lock messages map to extract the complete message history.
+                    std::lock_guard<std::mutex> lock(messagesMutex);
+                    for (const auto &kv : messages) {
+                        const Message &msg = kv.second;
+                        // Include messages if the user is either the sender or the recipient.
+                        if (msg.sender == username || msg.recipient == username) {
+                            bool skip = false;
+                            // Skip messages that are still pending as offline messages.
+                            for (const auto &id : offlineIds)
+                                if (id == msg.id) { skip = true; break; }
+                            if (!skip)
+                                historyMessages.push_back(kv);
+                        }
+                    }
+                }
+                // Sort the history messages based on the message ID (assuming lower ID means older message).
+                std::sort(historyMessages.begin(), historyMessages.end(),
+                          [](const std::pair<int, Message>& a, const std::pair<int, Message>& b) {
+                              return a.first < b.first;
+                          });
+                // Send the sorted history messages to the user.
+                for (const auto &pair : historyMessages) {
+                    Packet histPkt;
+                    histPkt.op_code = 'h';
+                    histPkt.sender = pair.second.sender;
+                    histPkt.recipient = pair.second.recipient;
+                    histPkt.message = pair.second.content;
+                    histPkt.message_id = pair.second.id;
+                    sendPacketSSL(ssl, histPkt);
+                }
+            }
+            else if (op == 'l') {
+                // 'l' operation: List users whose names match a given search pattern.
+                std::string searchPattern = pkt->sender;
+                std::string matchedUsers;
+                {
+                    // Lock userMap while searching for matching usernames.
+                    std::lock_guard<std::mutex> lock(userMapMutex);
+                    for (const auto &kv : userMap) {
+                        // If the search pattern is empty or found within the username, include it.
+                        if (searchPattern.empty() ||
+                            (kv.first.find(searchPattern) != std::string::npos)) {
+                            if (!matchedUsers.empty())
+                                matchedUsers += ", ";
+                            matchedUsers += kv.first;
+                        }
+                    }
+                }
+                std::cout << "[INFO] List users requested with pattern '" << searchPattern 
+                          << "'. Found: " << matchedUsers << "\n";
+                // Prepare a packet containing the list of matched users.
+                Packet listPkt;
+                listPkt.op_code = 'u';
+                listPkt.sender = "Server";
+                listPkt.message = matchedUsers;
+                sendPacketSSL(ssl, listPkt);
+            }
+            else if (op == 'd') {
+                // 'd' operation: Delete a message by ID.
+                std::string requestingUser = pkt->sender;
+                std::string msgId = pkt->message_id;
+                int msgIDnumeric = std::atoi(msgId.c_str());
+                bool deleted = false;
+                Message deletedMsg;
+                {
+                    // Lock messages map while searching for and deleting the message.
                     std::lock_guard<std::mutex> lock(messagesMutex);
                     auto it = messages.find(msgIDnumeric);
-                    if (it != messages.end() && it->second.sender == sender) {
+                    // Delete only if the message exists and the requesting user is the recipient.
+                    if (it != messages.end() && it->second.recipient == requestingUser) {
+                        deletedMsg = it->second;
                         messages.erase(it);
-                        std::cout << "[INFO] Deleted message " << msgIDnumeric << "\n";
-                    } else {
-                        std::cout << "[WARN] Cannot delete message " << msgIDnumeric << "\n";
+                        deleted = true;
                     }
                 }
-
-            } else if (op == 'q') {
-                // "quit"
-                std::cout << "[INFO] Received quit from " << currentUser << "\n";
+                if (deleted) {
+                    std::cout << "[INFO] Deleted message " << msgIDnumeric << " for " << requestingUser << "\n";
+                    {
+                        // Notify the sender about the deletion if they are online.
+                        std::lock_guard<std::mutex> lock(userMapMutex);
+                        auto it = userMap.find(deletedMsg.sender);
+                        if (it != userMap.end() && it->second.isOnline && it->second.ssl != nullptr) {
+                            Packet delNotif;
+                            delNotif.op_code = 'x';  // deletion notification op code
+                            delNotif.message_id = deletedMsg.id;
+                            sendPacketSSL(it->second.ssl, delNotif);
+                        }
+                    }
+                } else {
+                    std::cout << "[WARN] Unable to delete message " << msgIDnumeric << "\n";
+                }
+            }
+            else if (op == 'D') {
+                // 'D' operation: Delete a user account.
+                std::string username = pkt->sender;
+                bool accountDeleted = false;
+                {
+                    // Lock userMap while searching for and deleting the user account.
+                    std::lock_guard<std::mutex> lock(userMapMutex);
+                    auto it = userMap.find(username);
+                    if (it != userMap.end()) {
+                        userMap.erase(it);
+                        std::cout << "[INFO] Deleted account for user " << username << "\n";
+                        accountDeleted = true;
+                    } else {
+                        std::cout << "[WARN] Account for user " << username << " not found.\n";
+                    }
+                }
+                // Send a confirmation packet to the client regarding account deletion.
+                Packet confirmPkt;
+                confirmPkt.op_code = 'Y';
+                confirmPkt.message = accountDeleted ? "Account deleted successfully" : "Account deletion failed";
+                confirmPkt.username = "account_deleted";
+                sendPacketSSL(ssl, confirmPkt);
                 break;
-            } else {
+            }
+            else if (op == 'q') {
+                // 'q' operation: Client requested to quit the session.
+                std::cout << "[INFO] Client " << currentUser << " requested quit.\n";
+                break;
+            }
+            else {
+                // Unknown or unsupported op_code.
                 std::cout << "[WARN] Unknown op_code: " << op << "\n";
-                // Optionally send an error packet
             }
         }
     }
-
-    // Mark user offline
+    // Cleanup: Mark the current user as offline.
     if (!currentUser.empty()) {
         std::lock_guard<std::mutex> lock(userMapMutex);
         auto it = userMap.find(currentUser);
         if (it != userMap.end()) {
             it->second.isOnline = false;
-            it->second.socketFd = -1;
+            it->second.ssl = nullptr;
         }
     }
+    // Shutdown SSL connection and close the socket.
+    int sockFd = SSL_get_fd(ssl);
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
     close(sockFd);
 }
 
+// ============================================================================
+// Main Function: Server Entry Point
+// ============================================================================
 
+/**
+ * @brief Main function to start the SSL server.
+ * 
+ * Sets up the server socket, initializes SSL, listens for incoming connections,
+ * and creates a new thread to handle each client.
+ * 
+ * @param argc Number of command-line arguments.
+ * @param argv Array of command-line arguments.
+ * @return int Exit status code.
+ */
 int main(int argc, char* argv[]) {
-    int port = 54000;   // Default port: 54000 
-
-    if (argc == 1) {
-        std::string p = std::to_string(port); 
-        std::cout << "Using port " << p << "...\n";
-    } else if (argc == 2) {
-        port = std::atoi(argv[1]); 
-        std::cout << "Using port " << argv[1] << "...\n";
+    int port = 54000; // Default port if not specified by user.
+    if (argc == 1)
+        std::cout << "Using port " << port << "...\n";
+    else if (argc == 2) {
+        port = std::atoi(argv[1]);
+        std::cout << "Using port " << port << "...\n";
     } else {
-        std::cerr << "Usage: " << argv[0] << " <port>" << std::endl; 
-        return 1; 
+        std::cerr << "Usage: " << argv[0] << " <port>\n";
+        return 1;
     }
 
-    // Create TCP socket (IPv4)
+    // Initialize the SSL context (loads certificate and private key).
+    SSL_CTX* ctx = initializeSSLContext();
+
+    // Create a TCP socket for the server.
     int serverSock = socket(AF_INET, SOCK_STREAM, 0);
     if (serverSock < 0) {
         perror("socket failed");
         return EXIT_FAILURE;
     }
 
-    // Set socket as reusable
+    // Set socket options to allow reuse of the address.
     int opt = 1;
     if (setsockopt(serverSock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         perror("setsockopt failed");
@@ -426,47 +615,60 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    // Define host address
+    // Define and set up the server address structure.
     sockaddr_in serverAddr;
     std::memset(&serverAddr, 0, sizeof(serverAddr));
-    serverAddr.sin_family      = AF_INET;
-    serverAddr.sin_addr.s_addr = INADDR_ANY;
-    serverAddr.sin_port        = htons(port);
+    serverAddr.sin_family = AF_INET;               // IPv4
+    serverAddr.sin_addr.s_addr = INADDR_ANY;         // Listen on any network interface
+    serverAddr.sin_port = htons(port);               // Convert port to network byte order
 
-    // Bind socket
-    if (bind(serverSock, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+    // Bind the socket to the specified address and port.
+    if (bind(serverSock, reinterpret_cast<struct sockaddr*>(&serverAddr), sizeof(serverAddr)) < 0) {
         perror("bind failed");
         close(serverSock);
         return EXIT_FAILURE;
     }
 
-    // Listen
+    // Start listening for incoming connections.
     if (listen(serverSock, SOMAXCONN) < 0) {
         perror("listen failed");
         close(serverSock);
         return EXIT_FAILURE;
     }
-
     std::cout << "[INFO] Server listening on port " << port << "...\n";
 
+    // Main server loop: accept and handle client connections.
     while (true) {
         sockaddr_in clientAddr;
         socklen_t clientLen = sizeof(clientAddr);
-        int clientSock = accept(serverSock, (struct sockaddr*)&clientAddr, &clientLen);
+        // Accept an incoming client connection.
+        int clientSock = accept(serverSock, reinterpret_cast<struct sockaddr*>(&clientAddr), &clientLen);
         if (clientSock < 0) {
             perror("accept failed");
             continue;
         }
+        // Create a new SSL object for the client and associate it with the socket.
+        SSL* ssl = SSL_new(ctx);
+        SSL_set_fd(ssl, clientSock);
+        // Perform the SSL/TLS handshake.
+        if (SSL_accept(ssl) <= 0) {
+            ERR_print_errors_fp(stderr);
+            SSL_free(ssl);
+            close(clientSock);
+            continue;
+        }
+        // Log the new connection's IP address and port.
         char ipBuf[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &(clientAddr.sin_addr), ipBuf, sizeof(ipBuf));
         std::cout << "[INFO] New client from " << ipBuf 
                   << ":" << ntohs(clientAddr.sin_port) << "\n";
-        
-        // Handle this client in a separate thread
-        std::thread t(handleClient, clientSock);
-        t.detach();
+        // Create a new thread to handle the client.
+        std::thread t(handleClient, ssl);
+        t.detach();  // Detach the thread to allow independent execution.
     }
 
+    // Cleanup: close the server socket and free the SSL context.
     close(serverSock);
+    SSL_CTX_free(ctx);
     return 0;
 }

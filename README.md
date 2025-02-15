@@ -1,4 +1,4 @@
-# Secure Chat Application
+# Chat Application
 
 This project implements a secure chat application using SSL and a custom JSON wire protocol. It consists of two main components:
 
@@ -57,8 +57,7 @@ This project implements a secure chat application using SSL and a custom JSON wi
     -largon2 -lssl -lcrypto \
     -o client`
 
-  - Run: `./client <server IP address> <port_number>`. 
-
+  - Run: `python3 client.py <server IP address> <port number>`.  
 
 ## How It Works Together
 
@@ -78,5 +77,40 @@ This project implements a secure chat application using SSL and a custom JSON wi
 4. **User List & Account Management:**  
    Clients may search for users, request a list, delete specific messages, or even delete their own account.
 
+# Chat Application Tests
 
+This project contains unit tests for both the server and client components of the chat application using GoogleTest.
 
+## Prerequisites
+
+- **C++17** compiler (e.g. g++)
+- [GoogleTest](https://github.com/google/googletest) installed
+- OpenSSL development libraries
+
+## Building the Tests
+
+Two separate test binaries are provided:
+
+1. **Server Tests**  
+   Build with:
+   ```bash
+   g++ -std=c++17 -pthread \
+    -I/opt/homebrew/opt/googletest/include \
+    -I/opt/homebrew/opt/openssl@3/include \
+    -I./wire_protocol \
+    -L/opt/homebrew/opt/googletest/lib \
+    -L/opt/homebrew/opt/openssl@3/lib \
+    server_test.cpp wire_protocol/json_wire_protocol.cpp wire_protocol/packet.cpp \
+    -lgtest -lgtest_main -lssl -lcrypto -o server_test
+
+2. **Client Tests** 
+    Build with: 
+    ```bash 
+    g++ -std=c++17 -pthread \
+    -I/opt/homebrew/opt/googletest/include \
+    -I/opt/homebrew/opt/openssl@3/include \
+    -I./wire_protocol \
+    -L/opt/homebrew/opt/googletest/lib \
+    -L/opt/homebrew/opt/openssl@3/lib \
+    client_test.cpp wire_protocol/json_wire_protocol.cpp wire_protocol/packet.cpp \
+    -lgtest -lgtest_main -lssl -lcrypto -o client_test

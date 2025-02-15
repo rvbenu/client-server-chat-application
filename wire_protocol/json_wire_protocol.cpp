@@ -1,17 +1,21 @@
+// json_wire_protocol.cpp
 #include "json_wire_protocol.h"
 #include <iostream>
-#include <cstring>       // For memset
-#include "json.hpp"
+#include <cstring>
+#include <arpa/inet.h>
+#include <openssl/ssl.h>
+#include <unistd.h>
+#include "json.hpp"  // Requires nlohmann::json
 
-/**
- * @brief Helper function to send all data in a loop until fully transmitted or error.
- */
-static ssize_t sendAll(Socket sock, const uint8_t* data, size_t length) {
+// Helper functions for SSL I/O
+
+static ssize_t sendAllSSL(SSL* ssl, const uint8_t* data, size_t length) {
     size_t totalSent = 0;
     while (totalSent < length) {
-        ssize_t sent = send(sock, data + totalSent, length - totalSent, 0);
-        if (sent == -1) {
-            perror("send failed");
+        int sent = SSL_write(ssl, data + totalSent, length - totalSent);
+        if (sent <= 0) {
+            int err = SSL_get_error(ssl, sent);
+            std::cerr << "[json_wire_protocol] SSL_write failed (error " << err << ")\n";
             return -1;
         }
         totalSent += sent;
@@ -19,19 +23,13 @@ static ssize_t sendAll(Socket sock, const uint8_t* data, size_t length) {
     return totalSent;
 }
 
-/**
- * @brief Helper function to receive all data in a loop until fully read or error.
- */
-static ssize_t recvAll(Socket sock, uint8_t* data, size_t length) {
+static ssize_t recvAllSSL(SSL* ssl, uint8_t* data, size_t length) {
     size_t totalReceived = 0;
     while (totalReceived < length) {
-        ssize_t r = recv(sock, data + totalReceived, length - totalReceived, 0);
+        int r = SSL_read(ssl, data + totalReceived, length - totalReceived);
         if (r <= 0) {
-            if (r == 0) {
-                std::cerr << "Connection closed by peer.\n";
-            } else {
-                perror("recv failed");
-            }
+            int err = SSL_get_error(ssl, r);
+            std::cerr << "[json_wire_protocol] SSL_read failed (error " << err << ")\n";
             return -1;
         }
         totalReceived += r;
@@ -39,11 +37,8 @@ static ssize_t recvAll(Socket sock, uint8_t* data, size_t length) {
     return totalReceived;
 }
 
-/**
- * @brief Serialize a Packet to a binary buffer (MessagePack) using nlohmann::json.
- */
+// Serialize a Packet into MessagePack (via nlohmann::json)
 std::vector<uint8_t> serializePacket(const Packet& pkt) {
-    // 1) Convert Packet fields to nlohmann::json
     nlohmann::json j;
     j["op_code"]     = std::string(1, pkt.op_code);
     j["username"]    = pkt.username;
@@ -53,112 +48,58 @@ std::vector<uint8_t> serializePacket(const Packet& pkt) {
     j["message"]     = pkt.message;
     j["message_id"]  = pkt.message_id;
     j["isValidated"] = pkt.isValidated;
-
-    // 2) Convert JSON -> MessagePack
     std::vector<uint8_t> msgpackData = nlohmann::json::to_msgpack(j);
     return msgpackData;
 }
 
-/**
- * @brief Deserialize a binary buffer (MessagePack) into a Packet object.
- */
+// Deserialize MessagePack data into a Packet
 std::unique_ptr<Packet> deserializePacket(const std::vector<uint8_t>& data) {
-    // 1) Convert MessagePack -> JSON
     nlohmann::json j = nlohmann::json::from_msgpack(data);
-
-    // 2) Construct a Packet and populate
     auto pkt = std::make_unique<Packet>();
-
-    // op_code
-    if (j.contains("op_code") && j["op_code"].is_string()) {
-        std::string opStr = j["op_code"].get<std::string>();
-        if (!opStr.empty()) {
-            pkt->op_code = opStr[0];
-        }
-    }
-    // username
-    if (j.contains("username")) {
-        pkt->username = j["username"].get<std::string>();
-    }
-    // password
-    if (j.contains("password")) {
-        pkt->password = j["password"].get<std::string>();
-    }
-    // sender
-    if (j.contains("sender")) {
-        pkt->sender = j["sender"].get<std::string>();
-    }
-    // recipient
-    if (j.contains("recipient")) {
-        pkt->recipient = j["recipient"].get<std::string>();
-    }
-    // message
-    if (j.contains("message")) {
-        pkt->message = j["message"].get<std::string>();
-    }
-    // message_id
-    if (j.contains("message_id")) {
-        pkt->message_id = j["message_id"].get<std::string>();
-    }
-    // isValidated
-    if (j.contains("isValidated")) {
-        pkt->isValidated = j["isValidated"].get<bool>();
-    }
-
+    std::string opStr = j.value("op_code", "");
+    if (!opStr.empty())
+        pkt->op_code = opStr[0];
+    pkt->username    = j.value("username", "");
+    pkt->password    = j.value("password", "");
+    pkt->sender      = j.value("sender", "");
+    pkt->recipient   = j.value("recipient", "");
+    pkt->message     = j.value("message", "");
+    pkt->message_id  = j.value("message_id", "");
+    pkt->isValidated = j.value("isValidated", false);
     return pkt;
 }
 
-/**
- * @brief Send a Packet over a socket with a 4-byte size prefix.
- */
-int sendPacket(Socket socket, const Packet& pkt) {
+// Send a Packet over an SSL connection using a 4-byte length prefix.
+int sendPacketSSL(SSL* ssl, const Packet& pkt) {
     try {
-        // Serialize the Packet
         std::vector<uint8_t> data = serializePacket(pkt);
-
-        // Send size header (4 bytes in network byte order)
         uint32_t netSize = htonl(static_cast<uint32_t>(data.size()));
-        if (sendAll(socket, reinterpret_cast<const uint8_t*>(&netSize), 4) != 4) {
+        if (sendAllSSL(ssl, reinterpret_cast<const uint8_t*>(&netSize), sizeof(netSize)) != sizeof(netSize))
             return FAILURE;
-        }
-
-        // Send actual data
-        ssize_t sent = sendAll(socket, data.data(), data.size());
-        if (sent != static_cast<ssize_t>(data.size())) {
+        if (sendAllSSL(ssl, data.data(), data.size()) != static_cast<ssize_t>(data.size()))
             return FAILURE;
-        }
         return SUCCESS;
-    } catch (const std::exception& e) {
-        std::cerr << "[sendPacket] Exception: " << e.what() << "\n";
+    } catch (const std::exception &e) {
+        std::cerr << "[json_wire_protocol] Exception in sendPacketSSL: " << e.what() << "\n";
         return FAILURE;
     }
 }
 
-/**
- * @brief Receive a Packet from a socket with a 4-byte size prefix.
- */
-std::unique_ptr<Packet> receivePacket(Socket socket) {
-    // Read the size header (4 bytes)
+// Receive a Packet over an SSL connection.
+std::unique_ptr<Packet> receivePacketSSL(SSL* ssl) {
     uint32_t netSize = 0;
-    if (recvAll(socket, reinterpret_cast<uint8_t*>(&netSize), 4) != 4) {
-        return nullptr; // error or disconnect
-    }
+    if (recvAllSSL(ssl, reinterpret_cast<uint8_t*>(&netSize), sizeof(netSize)) != sizeof(netSize))
+        return nullptr;
     uint32_t dataSize = ntohl(netSize);
-    if (dataSize == 0) {
-        return nullptr; // Possibly empty or error
-    }
-
-    // Read the actual data
+    if (dataSize == 0)
+        return nullptr;
     std::vector<uint8_t> buffer(dataSize);
-    if (recvAll(socket, buffer.data(), dataSize) != static_cast<ssize_t>(dataSize)) {
-        return nullptr; // error or disconnect
-    }
-
-    // Deserialize into a Packet
+    if (recvAllSSL(ssl, buffer.data(), dataSize) != static_cast<ssize_t>(dataSize))
+        return nullptr;
     try {
         return deserializePacket(buffer);
-    } catch (const std::exception& e) {
-        std::cerr << "[receivePacket] Exception: " << e.what() << "\n";
+    } catch (const std::exception &e) {
+        std::cerr << "[json_wire_protocol] Exception in receivePacketSSL: " << e.what() << "\n";
         return nullptr;
     }
 }

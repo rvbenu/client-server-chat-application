@@ -1,0 +1,56 @@
+Sat Feb 8 Ruben
+
+Used getaddrinfo() to find a feasible address to establish a connection between cleint and server. 
+
+`server.cpp` and `client.cpp` assume the messages sent will be short for now. 
+TO-DO: When larger messages are sent, they must be broken down. This is to be implemented. 
+
+
+
+
+
+
+
+Sat Feb 9 Ruben 
+
+In `server.cpp`, connections are continuously being accepted by using an 
+infinite loop. When a connection is accepted, a thread is crated. Function 
+`manage_client_communication` manages client communication independently.
+The thread is detached. 
+
+Created files for the class UserAccount.  
+TO-DO: The `hash_function` for passwords must be implemented.  
+
+So far, the TCP connection with sockets is pretty much managed by the current code. 
+Next, the validation of usernames and passwords must be implemented and the way 
+the server and client will communicate about this must be implemented as well. 
+
+Check comments in server.cpp and client.cpp for more details. 
+
+
+
+Sun Feb 10 Ruben
+
+
+Decided to create a class `packet.h` that has many fields that won't necesarily be 
+used for every communication between server and client. These packets are the only (main)
+ones that will be serialized. 
+
+The custom protocol is simple and uses / and spaces (goes from strings to binary) using encode. 
+This is faster than the json protocol as the json protocol makes use of external libraries 
+that most of the time add unnecessary detail for the simplicity of this application. 
+
+According to a couple of practical tests while I was implementing the custom protocol, 
+the custom protocol takes 0.8 the time it took for the json protocol to send packed data. 
+
+For the json protocol implementation, made use of lnohlamn json library and MessagePack (a 
+built in json-binary feature for this json library). 
+
+
+
+
+
+Tue Feb 11 Ruben 
+
+Modularized some components in client.cpp and server.cpp to improve the quality of utests. 
+E.g., created connect to server function. Added unit tests. 

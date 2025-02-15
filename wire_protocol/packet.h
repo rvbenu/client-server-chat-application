@@ -35,7 +35,6 @@ public:
      */
     Packet();
 
-    // Optionally, you can add convenience constructors if desired
 };
 
 #endif // PACKET_H
