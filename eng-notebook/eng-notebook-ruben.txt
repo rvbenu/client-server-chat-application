@@ -41,7 +41,8 @@ protocol implemented as defined by the lnohmann library for cpp, which
 most of the time add unnecessary detail for the purposes of this 
 application. 
 
-Based on testing of the two different protocols, the custom protocol takes eighty percent of the time it took for the json protocol to send Packet 
+Based on testing of the two different protocols, the custom protocol 
+takes eighty percent of the time it took for the json protocol to send Packet 
 objects (serialized according to the protocol 
 
 Implemented the json protocol. Made use of lnohmann json library and 
