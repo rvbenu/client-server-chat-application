@@ -1,0 +1,58 @@
+2/5 (Wednesday)
+
+Met with Ruben after class to discuss approach. Tried to draw out the general client server interaction, but seemed to get a little caught up with details and couldn't really visualize the entire process. Opted for a more headfirst approach, with refinement as we went along.
+
+Decided to use C++, since I will be using it for my summer internship. Set up Github repo, established following gameplan: both of us should try to get a simple one-server, multiple-client test system working to become familiar with C++ socket configuration. From there, we will just start working on functionality specified in the assignment, and reconvene over the weekend to benchmark and begin formalizing.
+
+ 
+2/6 (Thursday)
+
+Used ChatGPT to develop copies of the in-class examples in C++ with detailed comments. Read through them until I had a strong understanding of socket opening, binding, and use. Began to build out handleClient method, with userAuthenticate sub-method. Used parseable strings with opcodes like LOGIN and REGISTER to initiate storage/authenticate users with global data structures (unordered maps to relate users and passwords, users and sockets). All passwords currently stored in plaintext. Then, used similar approach to return simple string list of users containing wildcard. Was unsure what "wildcard" should entail but decided that regex might be a little too much complexity. Tried to start sending messages, but realized that not much progress would be made without structs to compartmentalize information.
+
+ 
+2/9 (Sunday)
+
+Pushed all current code to repo (not many changes since Thursday due to busy weekend). Took a look at Ruben's code, saw that we had made similar progress, but he had begun incorporating the structs I had thought about. 
+
+ 
+2/10 (Monday)
+
+Met with Ruben again after class. Began to delineate remaining tasks: password security, implementation of JSON/custom wire protocol, remaining functionality, and GUI. Ruben opted to tackle the JSON/custom wire protocol, which would also entail the sending of messages, listing users, and other base functionality. I decided to work on security first, then work on the CLI.
+
+Security: I recalled that we should not transmit any passwords in plaintext, so looked into methods to not only secure passwords at rest, but also in transit. Process to hash and salt passwords was not too complex: use argon2 library with hash and validate functions given hardcoded parameters. This is stored in the user_auth directory. The more difficult part was securing the connection. Some possible implementations:
+
+    TLS/SSL: potentially difficult setup, but robust use, strong security, and available libraries
+    Challenge Response Protocol: conceptually less complex than SSL, but harder to implement well
+    Pre-Shared Keys: simplest option overall, but (in my opinion) defeats purpose of remote messaging system.
+
+I opted for an OpenSSL implementation, made simpler by using self-signed keys. Though the public key does have to be distributed prior to use, I figured this still seemed more realistic than the pre-shared keys. I used ChatGPT to create the SSLContext function, added the necessary instructions in main, and replaced 1) send/receive calls and 2) socket file descriptors with SSL pointers.
+
+GUI: I began researching GUI implementations, with the intention of starting tomorrow (Tuesday). Some options included Qt for C++ and Tkinter for Python. Some considerations: we wanted to have a GUI separate from the client, for debugging and potential console use considerations; we wanted to GUI to be the easiest part of the code to review and modify; we were willing to sacrifice perfect integration for ease of use. For this reason, I opted for Tkinter. Even though Qt would better integrate, since everything is in C++, it seemed to rely on direct integration into the client, with socket connections and more. By using Tkinter, it almost self-imposed a restriction to just what could be passed via stdin/stdout (we could use sockets but it would be far more complicated with our existing client). Since it would be in Python, it also made it much easier to review and make intuitive changes, especially since it wasn't our primary focus.
+
+ 
+
+2/11 (Tuesday)
+
+Made some considerable progress today.
+
+GUI: Used ChatGPT to generate the current layout, and interfaced specifically with the process_queue method to ensure the presentation of data on the interface, and the function specific methods to send instructions back to the client/server system. However, this required some modification of the client that Ruben had begun to implement. He had designed it to be primarily console interactive, so I changed it so that all data was sent and received in pseudo-JSON format, for ease of parsing. The only exception to this was system messaging from the server, which was kept in plain text for ease of interpretation and parsed using exact phrasing for authentication (may be a security risk).
+
+Before moving forward, also had to verify thread safety, since I seemed to encounter frequent deadlock. I went through the server and minimize nested mutexes and implemented scoped guards where possible.
+
+Specific functions:
+
+Sent messages: To ensure messages that were sent were also displayed, I implemented a confirmation message opcode, that confirmed to the user that their message had been delivered (or at least left the server) by sending the messageID. Similarly, to populate all past messages (sent and received) I created the history opcode to retrieve all appropriate messages from the global message vector.
+
+Delete messages: This was quite difficult, but I created the delete message opcode to also users to delete received messages by sending the messageID back to the server, initiating a process of removing it the global message database, and removing it from the sender's end if active.
+
+Delete accounts: This wasn't too difficult, just a matter of sending the username back to the server with the opcode, completing the process and sending a packet back that upon parsing, disconnected the user.
+
+Receive specific messages: I interpreted this as meaning, if a message is sent while the recipient is away, that is an "undelivered message", which they must opt to receive after the fact. This required the manipulation of the offlineMessage vector contained in each User struct.
+
+Overall, this was a relatively intensive day, and required the addition of numerous opcodes, tokenization, and iterative modifications to the GUI. The biggest was the switch from a simple output console for messages to a box of listed items, which allowed selection for deletion, rather than using the typed in messageID (which would've required the messageID to be displayed explicitly). It currently is for testing and verification purposes, but can be removed without consequence.
+
+ 
+
+2/12 (Wednesday)
+
+Demo Day: Was concerned that the clients might not work on multiple computers, but issue was resolved by editing firewall rules. 
