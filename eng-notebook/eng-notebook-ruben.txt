@@ -54,3 +54,23 @@ Tue Feb 11 Ruben
 
 Modularized some components in client.cpp and server.cpp to improve the quality of utests. 
 E.g., created connect to server function. Added unit tests. 
+
+
+
+
+
+
+Sun Feb 16
+
+Created server.h with documentation. 
+
+IDEA: Improve modularity by creating functions to manage the different Packet objects (depending
+on `op_code`) as opposed to having big chunks of code to handle these inside `handleClient`. 
+
+IDEA: Create a Docker image to make it easier for users to use the application (avoiding 
+adding lots of paths to libraries, e.g., openssl, argon2, lnohmann-json). 
+
+Plan for tomorrow: Improve documentation for the wire protocol code (e.g., json_wire_procol.cpp, 
+custom_wire_protocol.cpp, packet.cpp). If possible, do the same for the client code.
+
+IDEA: Implement new fields in the `Packet` class such as `version`.
