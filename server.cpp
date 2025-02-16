@@ -13,28 +13,16 @@
 #include <unistd.h>
 #include <netdb.h> 
 #include <sys/types.h>  
-
-// OpenSSL headers for SSL/TLS support
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
-// Include user authentication functions, e.g. argon2CheckPassword, argon2HashPassword, etc.
 #include "user_auth/user_auth.h"
-
-// Include our JSON wire protocol functions for sending/receiving packets.
+#include "wire_protocol/packet.h"
 #include "wire_protocol/json_wire_protocol.h"           // (UN)COMMENT TO CHANGE PROTOCOLS.
 // #include "wire_protocol/custom_wire_protocol.h"      // (UN)COMMENT TO CHANGE PROTOCOLS.
 
-// Include packet definitions used for our custom protocol.
-#include "wire_protocol/packet.h"
 
-// ============================================================================
-// Data structure definitions
-// ============================================================================
-
-/**
- * @brief Structure representing a message exchanged between users.
- */
+// Structure about messages exchanged by users. 
 struct Message {
     std::string id;         // Unique message identifier as string
     std::string content;    // The actual message content
@@ -42,23 +30,15 @@ struct Message {
     std::string recipient;  // Recipient's username
 };
 
-/**
- * @brief Structure representing user information.
- * 
- * Contains the hashed password, online status, SSL connection pointer,
- * and any offline messages queued for the user.
- */
+// User information. 
 struct UserInfo {
     std::string password;      // Hashed password (using argon2)
     bool isOnline = false;     // Online status flag (false by default)
     int socketFd = -1;         // File descriptor for the user's socket
     SSL* ssl = nullptr;        // Pointer to the user's SSL connection
-    std::vector<Message> offlineMessages;  // Offline messages waiting for the user
+    std::vector<Message> offlineMessages;  // Unread, offline messages 
 };
 
-// ============================================================================
-// Global variables
-// ============================================================================
 
 // Global message counter for assigning unique IDs to messages.
 static int messageCounter = 0;
@@ -124,7 +104,7 @@ SSL_CTX* initializeSSLContext() {
  * 
  * Repeatedly receives login attempts until a valid login is achieved or the client disconnects.
  * Also supports switching to user registration if requested.
- * 
+ *  
  * @param ssl Pointer to the SSL connection.
  * @param initialUsername The initial username provided by the client.
  * @param initialPassword The initial password provided by the client.
@@ -273,6 +253,14 @@ bool userRegister(SSL* ssl, const std::string &initialUsername, const std::strin
  * @param ssl Pointer to the client's SSL connection.
  */
 void handleClient(SSL* ssl) {
+    
+    /** 
+     * Whenever this function is called in a thread created in main, 
+     * a fresh new connection is established between the server and the client. 
+     * Thus, a client will never be authenticated by the start of this function. 
+     * Thus, the first Packet the server expects is one with username and password 
+     * fields not empty so that the client can be authenticated. 
+     */
     bool isAuthenticated = false;  // Flag to indicate if the user has been authenticated.
     std::string currentUser;       // Stores the username of the authenticated user.
 
