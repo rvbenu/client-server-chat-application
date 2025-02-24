@@ -19,6 +19,9 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
+#include <grpcpp/grpcpp.h>
+#include "chat.grpc.pb.h"
+
 #include "user_auth/user_auth.h"
 #include "wire_protocol/packet.h"
 #include "wire_protocol/json_wire_protocol.h"           // (UN)COMMENT TO CHANGE PROTOCOLS.
@@ -132,3 +135,6 @@ bool userRegister(SSL* ssl, const std::string &initialUsername, const std::strin
  * @param ssl Pointer to the client's SSL connection.
  */
 void handleClient(SSL* ssl);
+
+
+#endif

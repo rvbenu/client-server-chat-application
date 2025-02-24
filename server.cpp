@@ -16,44 +16,12 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
+#include "server.h"
 #include "user_auth/user_auth.h"
 #include "wire_protocol/packet.h"
-#include "wire_protocol/json_wire_protocol.h"           // (UN)COMMENT TO CHANGE PROTOCOLS.
-// #include "wire_protocol/custom_wire_protocol.h"      // (UN)COMMENT TO CHANGE PROTOCOLS.
+#include "wire_protocol/json_wire_protocol.h"
 
-
-// Structure about messages exchanged by users. 
-struct Message {
-    std::string id;         // Unique message identifier as string
-    std::string content;    // The actual message content
-    std::string sender;     // Sender's username
-    std::string recipient;  // Recipient's username
-};
-
-// User information. 
-struct UserInfo {
-    std::string password;      // Hashed password (using argon2)
-    bool isOnline = false;     // Online status flag (false by default)
-    int socketFd = -1;         // File descriptor for the user's socket
-    SSL* ssl = nullptr;        // Pointer to the user's SSL connection
-    std::vector<Message> offlineMessages;  // Unread, offline messages 
-};
-
-
-// Global message counter for assigning unique IDs to messages.
-static int messageCounter = 0;
-
-// Global container to store all messages, mapped by a unique integer ID.
-static std::unordered_map<int, Message> messages;
-
-// Mutex to protect access to the messages map in multi-threaded environment.
-static std::mutex messagesMutex;
-
-// Global container to store user information, mapped by username.
-static std::unordered_map<std::string, UserInfo> userMap;
-
-// Mutex to protect access to the userMap.
-static std::mutex userMapMutex;
+// See `server.h` for global data structures declaration. 
 
 // Forward declarations of user registration and login functions.
 bool userRegister(SSL* ssl, const std::string &initialUsername, const std::string &initialPassword);

@@ -87,3 +87,10 @@ the application?
 
 Install cmake. See instructions in gRCP website for cpp. 
 https://grpc.io/docs/languages/cpp/quickstart/
+
+
+After creating the chat.proto file, I compiled it using: 
+
+
+protoc -I . --grpc_out=. --plugin=protoc-gen-grpc=$(which grpc_cpp_plugin) chat.proto
+protoc -I . --cpp_out=. chat.proto
