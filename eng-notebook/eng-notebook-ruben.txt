@@ -75,3 +75,15 @@ do the same for the client code.
 TODO: Implement new fields in the `Packet` class such as `version`.
 
 TODO: Improve test suit. 
+
+
+Sun Feb 23 
+
+Does the use of this tool make the application easier or more difficult? 
+What does it do to the size of the data passed? How does it change the 
+structure of the client? The server? How does this change the testing of 
+the application?
+
+
+Install cmake. See instructions in gRCP website for cpp. 
+https://grpc.io/docs/languages/cpp/quickstart/
