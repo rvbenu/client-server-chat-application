@@ -186,9 +186,15 @@ private:
     std::unique_ptr<ChatService::Stub> stub_;
 };
 
-//-----------------------------------------------------------------------------
-// Main Client Function: Reads commands from standard input and calls RPCs.
-//-----------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
 int main(int argc, char* argv[]) {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0] << " <server_address> <server_port>\n";

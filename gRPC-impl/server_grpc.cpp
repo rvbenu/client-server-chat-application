@@ -11,7 +11,7 @@
 #include <grpcpp/grpcpp.h>
 #include "chat.grpc.pb.h"
 #include "user_auth/user_auth.h"  // For argon2HashPassword(), argon2CheckPassword()
-#include "server.h"              // Global containers: userMap, messages, messageCounter, userMapMutex, messagesMutex
+#include "../server.h"              // Global containers: userMap, messages, messageCounter, userMapMutex, messagesMutex
 
 using grpc::Server;
 using grpc::ServerBuilder;
@@ -34,9 +34,7 @@ using chat::HistoryReply;
 using chat::UserListReply;
 using chat::MessageData;
 
-//-----------------------------------------------------------------------------
-// Implementation of our ChatService using gRPC (with TLS)
-//-----------------------------------------------------------------------------
+// Implementation using gRPC (with TLS)
 class ChatServiceImpl final : public ChatService::Service {
 public:
     // Registration RPC
@@ -268,7 +266,7 @@ void RunServer(const std::string& server_address) {
 }
 
 int main(int argc, char* argv[]) {
-    std::string server_address = "0.0.0.0:50051";
+    std::string server_address = "0.0.0.0:50051"; // default
     RunServer(server_address);
     return 0;
 }
