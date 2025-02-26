@@ -77,7 +77,12 @@ TODO: Implement new fields in the `Packet` class such as `version`.
 TODO: Improve test suit. 
 
 
+
+
+
 Sun Feb 23 
+
+Questions to have in mind: 
 
 Does the use of this tool make the application easier or more difficult? 
 What does it do to the size of the data passed? How does it change the 
@@ -85,12 +90,18 @@ structure of the client? The server? How does this change the testing of
 the application?
 
 
-Install cmake. See instructions in gRCP website for cpp. 
-https://grpc.io/docs/languages/cpp/quickstart/
 
 
-After creating the chat.proto file, I compiled it using: 
+To get started with gRPC: `https://grpc.io/docs/languages/cpp/quickstart/`
+
+Compile chat.proto: `protoc --proto_path=. --cpp_out=. --grpc_out=. --plugin=protoc-gen-grpc=`which grpc_cpp_plugin` chat.proto`
+
+Resulting files: 
+chat.pb.h (Protocol Buffers header)
+chat.pb.cc (Protocol Buffers implementation)
+chat.grpc.pb.h (gRPC service header)
+chat.grpc.pb.cc (gRPC service implementation)
 
 
-protoc -I . --grpc_out=. --plugin=protoc-gen-grpc=$(which grpc_cpp_plugin) chat.proto
-protoc -I . --cpp_out=. chat.proto
+
+

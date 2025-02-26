@@ -2,45 +2,51 @@ syntax = "proto3";
 package chat;
 
 service ChatService {
-  // Registers a new user.
   rpc Register(RegisterRequest) returns (StatusReply);
-  // Logs in an existing user.
   rpc Login(LoginRequest) returns (LoginReply);
-  // Sends a message from sender to recipient.
+  rpc Logout(SessionRequest) returns (StatusReply);
   rpc SendMessage(MessageRequest) returns (StatusReply);
-  // Retrieves offline messages.
   rpc RetrieveOfflineMessages(OfflineRequest) returns (OfflineReply);
-  // Retrieves message history.
   rpc MessageHistory(HistoryRequest) returns (HistoryReply);
-  // Lists users matching a pattern.
   rpc ListUsers(UserListRequest) returns (UserListReply);
-  // Deletes a message.
   rpc DeleteMessage(DeleteMessageRequest) returns (StatusReply);
-  // Deletes a user account.
   rpc DeleteAccount(AccountRequest) returns (StatusReply);
-  // (Optionally) signals quit/disconnect.
   rpc Quit(Empty) returns (StatusReply);
 }
 
 message RegisterRequest {
   string username = 1;
-  string password = 2;
+  bytes password_hash = 2;
 }
 
 message LoginRequest {
   string username = 1;
-  string password = 2;
+  bytes password_hash = 2;
+}
+
+message LoginReply {
+  bool success = 1;
+  string session_token = 2;
+  int32 unread_messages = 3;
+  string error_message = 4;
+}
+
+message SessionRequest {
+  string username = 1;
+  string session_token = 2;
 }
 
 message MessageRequest {
   string sender = 1;
   string recipient = 2;
   string message = 3;
+  int64 timestamp = 4;
 }
 
 message OfflineRequest {
   string username = 1;
   int32 count = 2;
+  bool mark_as_read = 3;
 }
 
 message OfflineReply {
@@ -49,6 +55,10 @@ message OfflineReply {
 
 message HistoryRequest {
   string username = 1;
+  string recipient = 2;
+  int64 start_time = 3;
+  int64 end_time = 4;
+  int32 limit = 5;
 }
 
 message HistoryReply {
@@ -57,6 +67,8 @@ message HistoryReply {
 
 message UserListRequest {
   string pattern = 1;
+  int32 page = 2;
+  int32 page_size = 3;
 }
 
 message UserListReply {
@@ -65,7 +77,7 @@ message UserListReply {
 
 message DeleteMessageRequest {
   string username = 1;
-  string message_id = 2;
+  repeated string message_ids = 2;
 }
 
 message AccountRequest {
@@ -77,11 +89,7 @@ message MessageData {
   string sender = 2;
   string recipient = 3;
   string content = 4;
-}
-
-message LoginReply {
-  bool success = 1;
-  string error_message = 2;
+  int64 timestamp = 5;
 }
 
 message StatusReply {

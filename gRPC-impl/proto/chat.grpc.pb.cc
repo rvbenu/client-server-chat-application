@@ -24,6 +24,7 @@ namespace chat {
 static const char* ChatService_method_names[] = {
   "/chat.ChatService/Register",
   "/chat.ChatService/Login",
+  "/chat.ChatService/Logout",
   "/chat.ChatService/SendMessage",
   "/chat.ChatService/RetrieveOfflineMessages",
   "/chat.ChatService/MessageHistory",
@@ -42,13 +43,14 @@ std::unique_ptr< ChatService::Stub> ChatService::NewStub(const std::shared_ptr< 
 ChatService::Stub::Stub(const std::shared_ptr< ::grpc::ChannelInterface>& channel, const ::grpc::StubOptions& options)
   : channel_(channel), rpcmethod_Register_(ChatService_method_names[0], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
   , rpcmethod_Login_(ChatService_method_names[1], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
-  , rpcmethod_SendMessage_(ChatService_method_names[2], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
-  , rpcmethod_RetrieveOfflineMessages_(ChatService_method_names[3], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
-  , rpcmethod_MessageHistory_(ChatService_method_names[4], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
-  , rpcmethod_ListUsers_(ChatService_method_names[5], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
-  , rpcmethod_DeleteMessage_(ChatService_method_names[6], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
-  , rpcmethod_DeleteAccount_(ChatService_method_names[7], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
-  , rpcmethod_Quit_(ChatService_method_names[8], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
+  , rpcmethod_Logout_(ChatService_method_names[2], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
+  , rpcmethod_SendMessage_(ChatService_method_names[3], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
+  , rpcmethod_RetrieveOfflineMessages_(ChatService_method_names[4], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
+  , rpcmethod_MessageHistory_(ChatService_method_names[5], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
+  , rpcmethod_ListUsers_(ChatService_method_names[6], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
+  , rpcmethod_DeleteMessage_(ChatService_method_names[7], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
+  , rpcmethod_DeleteAccount_(ChatService_method_names[8], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
+  , rpcmethod_Quit_(ChatService_method_names[9], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
   {}
 
 ::grpc::Status ChatService::Stub::Register(::grpc::ClientContext* context, const ::chat::RegisterRequest& request, ::chat::StatusReply* response) {
@@ -93,6 +95,29 @@ void ChatService::Stub::async::Login(::grpc::ClientContext* context, const ::cha
 ::grpc::ClientAsyncResponseReader< ::chat::LoginReply>* ChatService::Stub::AsyncLoginRaw(::grpc::ClientContext* context, const ::chat::LoginRequest& request, ::grpc::CompletionQueue* cq) {
   auto* result =
     this->PrepareAsyncLoginRaw(context, request, cq);
+  result->StartCall();
+  return result;
+}
+
+::grpc::Status ChatService::Stub::Logout(::grpc::ClientContext* context, const ::chat::SessionRequest& request, ::chat::StatusReply* response) {
+  return ::grpc::internal::BlockingUnaryCall< ::chat::SessionRequest, ::chat::StatusReply, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(channel_.get(), rpcmethod_Logout_, context, request, response);
+}
+
+void ChatService::Stub::async::Logout(::grpc::ClientContext* context, const ::chat::SessionRequest* request, ::chat::StatusReply* response, std::function<void(::grpc::Status)> f) {
+  ::grpc::internal::CallbackUnaryCall< ::chat::SessionRequest, ::chat::StatusReply, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(stub_->channel_.get(), stub_->rpcmethod_Logout_, context, request, response, std::move(f));
+}
+
+void ChatService::Stub::async::Logout(::grpc::ClientContext* context, const ::chat::SessionRequest* request, ::chat::StatusReply* response, ::grpc::ClientUnaryReactor* reactor) {
+  ::grpc::internal::ClientCallbackUnaryFactory::Create< ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(stub_->channel_.get(), stub_->rpcmethod_Logout_, context, request, response, reactor);
+}
+
+::grpc::ClientAsyncResponseReader< ::chat::StatusReply>* ChatService::Stub::PrepareAsyncLogoutRaw(::grpc::ClientContext* context, const ::chat::SessionRequest& request, ::grpc::CompletionQueue* cq) {
+  return ::grpc::internal::ClientAsyncResponseReaderHelper::Create< ::chat::StatusReply, ::chat::SessionRequest, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(channel_.get(), cq, rpcmethod_Logout_, context, request);
+}
+
+::grpc::ClientAsyncResponseReader< ::chat::StatusReply>* ChatService::Stub::AsyncLogoutRaw(::grpc::ClientContext* context, const ::chat::SessionRequest& request, ::grpc::CompletionQueue* cq) {
+  auto* result =
+    this->PrepareAsyncLogoutRaw(context, request, cq);
   result->StartCall();
   return result;
 }
@@ -282,6 +307,16 @@ ChatService::Service::Service() {
   AddMethod(new ::grpc::internal::RpcServiceMethod(
       ChatService_method_names[2],
       ::grpc::internal::RpcMethod::NORMAL_RPC,
+      new ::grpc::internal::RpcMethodHandler< ChatService::Service, ::chat::SessionRequest, ::chat::StatusReply, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(
+          [](ChatService::Service* service,
+             ::grpc::ServerContext* ctx,
+             const ::chat::SessionRequest* req,
+             ::chat::StatusReply* resp) {
+               return service->Logout(ctx, req, resp);
+             }, this)));
+  AddMethod(new ::grpc::internal::RpcServiceMethod(
+      ChatService_method_names[3],
+      ::grpc::internal::RpcMethod::NORMAL_RPC,
       new ::grpc::internal::RpcMethodHandler< ChatService::Service, ::chat::MessageRequest, ::chat::StatusReply, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(
           [](ChatService::Service* service,
              ::grpc::ServerContext* ctx,
@@ -290,7 +325,7 @@ ChatService::Service::Service() {
                return service->SendMessage(ctx, req, resp);
              }, this)));
   AddMethod(new ::grpc::internal::RpcServiceMethod(
-      ChatService_method_names[3],
+      ChatService_method_names[4],
       ::grpc::internal::RpcMethod::NORMAL_RPC,
       new ::grpc::internal::RpcMethodHandler< ChatService::Service, ::chat::OfflineRequest, ::chat::OfflineReply, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(
           [](ChatService::Service* service,
@@ -300,7 +335,7 @@ ChatService::Service::Service() {
                return service->RetrieveOfflineMessages(ctx, req, resp);
              }, this)));
   AddMethod(new ::grpc::internal::RpcServiceMethod(
-      ChatService_method_names[4],
+      ChatService_method_names[5],
       ::grpc::internal::RpcMethod::NORMAL_RPC,
       new ::grpc::internal::RpcMethodHandler< ChatService::Service, ::chat::HistoryRequest, ::chat::HistoryReply, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(
           [](ChatService::Service* service,
@@ -310,7 +345,7 @@ ChatService::Service::Service() {
                return service->MessageHistory(ctx, req, resp);
              }, this)));
   AddMethod(new ::grpc::internal::RpcServiceMethod(
-      ChatService_method_names[5],
+      ChatService_method_names[6],
       ::grpc::internal::RpcMethod::NORMAL_RPC,
       new ::grpc::internal::RpcMethodHandler< ChatService::Service, ::chat::UserListRequest, ::chat::UserListReply, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(
           [](ChatService::Service* service,
@@ -320,7 +355,7 @@ ChatService::Service::Service() {
                return service->ListUsers(ctx, req, resp);
              }, this)));
   AddMethod(new ::grpc::internal::RpcServiceMethod(
-      ChatService_method_names[6],
+      ChatService_method_names[7],
       ::grpc::internal::RpcMethod::NORMAL_RPC,
       new ::grpc::internal::RpcMethodHandler< ChatService::Service, ::chat::DeleteMessageRequest, ::chat::StatusReply, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(
           [](ChatService::Service* service,
@@ -330,7 +365,7 @@ ChatService::Service::Service() {
                return service->DeleteMessage(ctx, req, resp);
              }, this)));
   AddMethod(new ::grpc::internal::RpcServiceMethod(
-      ChatService_method_names[7],
+      ChatService_method_names[8],
       ::grpc::internal::RpcMethod::NORMAL_RPC,
       new ::grpc::internal::RpcMethodHandler< ChatService::Service, ::chat::AccountRequest, ::chat::StatusReply, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(
           [](ChatService::Service* service,
@@ -340,7 +375,7 @@ ChatService::Service::Service() {
                return service->DeleteAccount(ctx, req, resp);
              }, this)));
   AddMethod(new ::grpc::internal::RpcServiceMethod(
-      ChatService_method_names[8],
+      ChatService_method_names[9],
       ::grpc::internal::RpcMethod::NORMAL_RPC,
       new ::grpc::internal::RpcMethodHandler< ChatService::Service, ::chat::Empty, ::chat::StatusReply, ::grpc::protobuf::MessageLite, ::grpc::protobuf::MessageLite>(
           [](ChatService::Service* service,
@@ -362,6 +397,13 @@ ChatService::Service::~Service() {
 }
 
 ::grpc::Status ChatService::Service::Login(::grpc::ServerContext* context, const ::chat::LoginRequest* request, ::chat::LoginReply* response) {
+  (void) context;
+  (void) request;
+  (void) response;
+  return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+}
+
+::grpc::Status ChatService::Service::Logout(::grpc::ServerContext* context, const ::chat::SessionRequest* request, ::chat::StatusReply* response) {
   (void) context;
   (void) request;
   (void) response;
